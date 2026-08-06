@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use config::keyassignment::{KeyAssignment, ScrollbackEraseMode};
 use downcast_rs::{impl_downcast, Downcast};
 use parking_lot::MappedMutexGuard;
+use portable_pty::ExitStatus;
 use rangeset::RangeSet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -338,11 +339,20 @@ pub trait Pane: Downcast + Send + Sync {
         None
     }
 
+    /// Return a lightweight process description suitable for session restore.
+    fn get_process_info(&self, _policy: CachePolicy) -> Option<procinfo::LocalProcessInfo> {
+        self.get_foreground_process_info(_policy)
+    }
+
     fn tty_name(&self) -> Option<String> {
         None
     }
 
     fn exit_behavior(&self) -> Option<ExitBehavior> {
+        None
+    }
+
+    fn get_exit_status(&self) -> Option<ExitStatus> {
         None
     }
 }

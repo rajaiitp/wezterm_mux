@@ -1,7 +1,7 @@
 use crate::client::{ClientId, ClientInfo};
 use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
-use crate::tab::{SplitRequest, Tab, TabId};
+use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::window::{Window, WindowId};
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
@@ -1252,6 +1252,44 @@ impl Mux {
         };
 
         Ok((pane, size))
+    }
+
+    pub fn move_pane_to_tab(
+        &self,
+        pane_id: PaneId,
+        target_tab_id: TabId,
+        direction: SplitDirection,
+    ) -> anyhow::Result<()> {
+        let (_domain_id, _src_window_id, src_tab_id) = self
+            .resolve_pane_id(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {} not found", pane_id))?;
+        if src_tab_id == target_tab_id {
+            return Ok(());
+        }
+        let src_tab = self
+            .get_tab(src_tab_id)
+            .ok_or_else(|| anyhow::anyhow!("source tab {} not found", src_tab_id))?;
+        let target_tab = self
+            .get_tab(target_tab_id)
+            .ok_or_else(|| anyhow::anyhow!("target tab {} not found", target_tab_id))?;
+        let pane = src_tab
+            .remove_pane(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {} wasn't in its containing tab", pane_id))?;
+        let target_index = target_tab.get_active_idx();
+        target_tab.split_and_insert(
+            target_index,
+            SplitRequest {
+                direction,
+                target_is_second: true,
+                top_level: false,
+                size: SplitSize::Percent(50),
+            },
+            pane,
+        )?;
+        if src_tab.is_dead() {
+            self.remove_tab(src_tab_id);
+        }
+        Ok(())
     }
 
     pub async fn move_pane_to_new_tab(

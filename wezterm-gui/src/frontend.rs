@@ -17,6 +17,16 @@ use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
 use wezterm_toast_notification::*;
 
+fn schedule_native_session_save() {
+    promise::spawn::spawn(async {
+        smol::Timer::after(std::time::Duration::from_millis(100)).await;
+        if let Err(err) = smol::unblock(crate::native_session::save_now).await {
+            log::warn!("native session close save failed: {err:#}");
+        }
+    })
+    .detach();
+}
+
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,
     switching_workspaces: RefCell<bool>,
@@ -67,8 +77,17 @@ impl GuiFrontEnd {
                 }
                 MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
-                | MuxNotification::WindowCreated(_)
-                | MuxNotification::WindowRemoved(_) => {
+                | MuxNotification::WindowCreated(_) => {
+                    promise::spawn::spawn_into_main_thread(async move {
+                        let fe = crate::frontend::front_end();
+                        if !fe.is_switching_workspace() {
+                            fe.reconcile_workspace();
+                        }
+                    })
+                    .detach();
+                }
+                MuxNotification::WindowRemoved(_) => {
+                    schedule_native_session_save();
                     promise::spawn::spawn_into_main_thread(async move {
                         let fe = crate::frontend::front_end();
                         if !fe.is_switching_workspace() {
@@ -150,6 +169,7 @@ impl GuiFrontEnd {
                         | Alert::SetUserVar { .. },
                 } => {}
                 MuxNotification::Empty => {
+                    schedule_native_session_save();
                     if config::configuration().quit_when_all_windows_are_closed {
                         promise::spawn::spawn_into_main_thread(async move {
                             if mux::activity::Activity::count() == 0 {

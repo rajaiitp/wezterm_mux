@@ -15,12 +15,18 @@ mod list_clients;
 mod move_pane_to_new_tab;
 mod proxy;
 mod rename_workspace;
+mod restore_state;
+mod run_wait;
+mod save_state;
 mod send_text;
+mod session_state;
 mod set_tab_title;
 mod set_window_title;
 mod spawn_command;
 mod split_pane;
 mod tls_creds;
+mod wait;
+mod watch;
 mod zoom_pane;
 
 #[derive(Debug, Parser, Clone, Copy)]
@@ -163,6 +169,26 @@ Outputs the pane-id for the newly created pane on success"
     /// Zoom, unzoom, or toggle zoom state
     #[command(name = "zoom-pane", rename_all = "kebab")]
     ZoomPane(zoom_pane::ZoomPane),
+
+    /// Wait until a pane exits or disappears from the mux.
+    #[command(name = "wait", rename_all = "kebab")]
+    Wait(wait::WaitCommand),
+
+    /// Spawn a command and wait until its pane exits.
+    #[command(name = "run-wait", rename_all = "kebab", trailing_var_arg = true)]
+    RunWait(run_wait::RunWaitCommand),
+
+    /// Wait for text or a regular expression to appear in a pane.
+    #[command(name = "watch", rename_all = "kebab")]
+    Watch(watch::WatchCommand),
+
+    /// Save the native mux topology and pane metadata.
+    #[command(name = "save-state", rename_all = "kebab")]
+    SaveState(save_state::SaveStateCommand),
+
+    /// Restore windows, tabs, panes, and working directories from a snapshot.
+    #[command(name = "restore-state", rename_all = "kebab")]
+    RestoreState(restore_state::RestoreStateCommand),
 }
 
 async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
@@ -199,6 +225,11 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::SetWindowTitle(cmd) => cmd.run(client).await,
         CliSubCommand::RenameWorkspace(cmd) => cmd.run(client).await,
         CliSubCommand::ZoomPane(cmd) => cmd.run(client).await,
+        CliSubCommand::Wait(cmd) => cmd.run(client).await,
+        CliSubCommand::RunWait(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
+        CliSubCommand::Watch(cmd) => cmd.run(client).await,
+        CliSubCommand::SaveState(cmd) => cmd.run(client).await,
+        CliSubCommand::RestoreState(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
     }
 }
 

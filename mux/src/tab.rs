@@ -255,6 +255,14 @@ fn pane_tree(
         Tree::Leaf(pane) => {
             let dims = pane.get_dimensions();
             let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
+            let process = pane
+                .get_process_info(CachePolicy::FetchImmediate)
+                .map(|info| PaneProcessInfo {
+                    name: info.name,
+                    executable: info.executable.to_string_lossy().into_owned(),
+                    argv: info.argv,
+                    cwd: info.cwd.to_string_lossy().into_owned(),
+                });
             let cursor_pos = pane.get_cursor_position();
 
             PaneNode::Leaf(PaneEntry {
@@ -278,6 +286,7 @@ fn pane_tree(
                 left_col,
                 top_row,
                 tty_name: pane.tty_name(),
+                process,
             })
         }
     }
@@ -2146,6 +2155,14 @@ impl PaneNode {
 /// This type is used directly by the codec, take care to bump
 /// the codec version if you change this
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct PaneProcessInfo {
+    pub name: String,
+    pub executable: String,
+    pub argv: Vec<String>,
+    pub cwd: String,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct PaneEntry {
     pub window_id: WindowId,
     pub tab_id: TabId,
@@ -2161,6 +2178,8 @@ pub struct PaneEntry {
     pub top_row: usize,
     pub left_col: usize,
     pub tty_name: Option<String>,
+    #[serde(default)]
+    pub process: Option<PaneProcessInfo>,
 }
 
 #[derive(Deserialize, Clone, Serialize, PartialEq, Debug)]

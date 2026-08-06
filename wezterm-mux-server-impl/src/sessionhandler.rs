@@ -757,6 +757,36 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::GetPaneExitStatus(GetPaneExitStatus { pane_id }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let (exit_code, signal, is_alive) = match mux.get_pane(pane_id) {
+                                Some(pane) => {
+                                    let status = pane.get_exit_status();
+                                    (
+                                        status.as_ref().map(|status| status.exit_code()),
+                                        status
+                                            .and_then(|status| status.signal().map(str::to_owned)),
+                                        true,
+                                    )
+                                }
+                                None => (None, None, false),
+                            };
+                            Ok(Pdu::GetPaneExitStatusResponse(GetPaneExitStatusResponse {
+                                pane_id,
+                                exit_code,
+                                signal,
+                                is_alive,
+                            }))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
             Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id, .. }) => {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
@@ -1010,6 +1040,7 @@ impl SessionHandler {
             | Pdu::MovePaneToNewTabResponse { .. }
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
+            | Pdu::GetPaneExitStatusResponse { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)))
             }

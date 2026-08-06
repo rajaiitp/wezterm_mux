@@ -1091,6 +1091,11 @@ impl WindowInner {
             // https://github.com/wezterm/wezterm/issues/310.
             // But allow overriding the shadows independent of opacity as well:
             // <https://github.com/wezterm/wezterm/issues/2669>
+            let has_native_frame = self.config.window_decorations.intersects(
+                WindowDecorations::TITLE
+                    | WindowDecorations::RESIZE
+                    | WindowDecorations::INTEGRATED_BUTTONS,
+            );
             let shadow = if self
                 .config
                 .window_decorations
@@ -1102,6 +1107,8 @@ impl WindowInner {
                 .window_decorations
                 .contains(WindowDecorations::MACOS_FORCE_DISABLE_SHADOW)
             {
+                NO
+            } else if !has_native_frame {
                 NO
             } else {
                 is_opaque
@@ -1439,8 +1446,10 @@ fn decoration_to_mask(
             | NSWindowStyleMask::NSResizableWindowMask
             | NSWindowStyleMask::NSFullSizeContentViewWindowMask
     } else if decorations == WindowDecorations::NONE {
-        NSWindowStyleMask::NSTitledWindowMask
-            | NSWindowStyleMask::NSClosableWindowMask
+        // A hidden title bar still inherits AppKit's rounded title-window
+        // frame when NSTitledWindowMask is present. Keep NONE genuinely
+        // borderless, matching Ghostty and the explicit square-corners mode.
+        NSWindowStyleMask::NSClosableWindowMask
             | NSWindowStyleMask::NSMiniaturizableWindowMask
             | NSWindowStyleMask::NSFullSizeContentViewWindowMask
     } else if decorations == WindowDecorations::TITLE {

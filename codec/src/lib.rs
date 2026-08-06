@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 45;
+pub const CODEC_VERSION: usize = 47;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -502,6 +502,8 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    GetPaneExitStatus: 63,
+    GetPaneExitStatusResponse: 64,
 }
 
 impl Pdu {
@@ -907,6 +909,22 @@ pub struct GetPaneRenderableDimensionsResponse {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct LivenessResponse {
     pub pane_id: PaneId,
+    pub is_alive: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct GetPaneExitStatus {
+    pub pane_id: PaneId,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct GetPaneExitStatusResponse {
+    pub pane_id: PaneId,
+    /// The process exit code, if it has completed and the pane still exists.
+    pub exit_code: Option<u32>,
+    /// The signal name, if the process was terminated by a signal.
+    pub signal: Option<String>,
+    /// False when the pane has already been removed.
     pub is_alive: bool,
 }
 

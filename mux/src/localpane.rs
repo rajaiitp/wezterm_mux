@@ -125,6 +125,7 @@ pub struct LocalPane {
     pane_id: PaneId,
     terminal: Mutex<Terminal>,
     process: Mutex<ProcessState>,
+    exit_status: Mutex<Option<ExitStatus>>,
     pty: Mutex<Box<dyn MasterPty>>,
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
@@ -223,6 +224,10 @@ impl Pane for LocalPane {
         self.terminal.lock().user_vars().clone()
     }
 
+    fn get_exit_status(&self) -> Option<ExitStatus> {
+        self.exit_status.lock().clone()
+    }
+
     fn exit_behavior(&self) -> Option<ExitBehavior> {
         // If we are ssh, and we've not yet fully connected,
         // then override exit_behavior so that we can show
@@ -288,6 +293,7 @@ impl Pane for LocalPane {
                 };
 
                 if let Some(status) = status {
+                    self.exit_status.lock().replace(status.clone());
                     let success = match status.success() {
                         true => true,
                         false => configuration()
@@ -537,6 +543,14 @@ impl Pane for LocalPane {
         }
 
         self.divine_foreground_process(policy)
+    }
+
+    fn get_process_info(&self, policy: CachePolicy) -> Option<LocalProcessInfo> {
+        // Use the process-group root rather than the youngest foreground
+        // child. Editors such as Neovim commonly launch an LSP process; the
+        // latter would otherwise be mistaken for the application during
+        // session restore.
+        self.get_foreground_process_info(policy)
     }
 
     fn get_foreground_process_name(&self, policy: CachePolicy) -> Option<String> {
@@ -1029,6 +1043,7 @@ impl LocalPane {
                 signaller,
                 killed: false,
             }),
+            exit_status: Mutex::new(None),
             pty: Mutex::new(pty),
             writer: Mutex::new(writer),
             domain_id,

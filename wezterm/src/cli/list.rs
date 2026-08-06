@@ -139,6 +139,7 @@ struct CliListResultItem {
     is_active: bool,
     is_zoomed: bool,
     tty_name: Option<String>,
+    process: Option<mux::tab::PaneProcessInfo>,
 }
 
 impl CliListResultItem {
@@ -157,6 +158,7 @@ impl CliListResultItem {
             is_active_pane,
             is_zoomed_pane,
             tty_name,
+            process,
             size:
                 TerminalSize {
                     rows,
@@ -197,6 +199,7 @@ impl CliListResultItem {
             is_active: is_active_pane,
             is_zoomed: is_zoomed_pane,
             tty_name,
+            process,
         }
     }
 }

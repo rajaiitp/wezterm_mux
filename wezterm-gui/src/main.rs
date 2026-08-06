@@ -41,6 +41,7 @@ mod download;
 mod frontend;
 mod glyphcache;
 mod inputmap;
+mod native_session;
 mod overlay;
 mod quad;
 mod renderstate;
@@ -454,6 +455,21 @@ async fn async_run_terminal_gui(
 
     if !opts.attach {
         trigger_and_log_gui_startup(spawn_command).await;
+
+        // Let Lua startup hooks restore their own state first. Native restore
+        // only runs when they left the mux empty, avoiding duplicate sessions
+        // while the migration period uses both mechanisms.
+        if cmd.is_none()
+            && opts.workspace.is_none()
+            && opts.domain.is_none()
+            && Mux::get().iter_windows().is_empty()
+        {
+            match native_session::restore_if_available().await {
+                Ok(true) => log::info!("restored native Herdr session"),
+                Ok(false) => {}
+                Err(err) => log::warn!("native session restore failed: {err:#}"),
+            }
+        }
     }
 
     let is_connecting = opts.attach;
@@ -776,6 +792,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     }
 
     let gui = crate::frontend::try_new()?;
+    native_session::start_periodic_save();
     let activity = Activity::new();
 
     promise::spawn::spawn(async move {
@@ -787,7 +804,11 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     .detach();
 
     maybe_show_configuration_error_window();
-    gui.run_forever()
+    let result = gui.run_forever();
+    if let Err(err) = native_session::save_now() {
+        log::warn!("native session final save failed: {err:#}");
+    }
+    result
 }
 
 fn fatal_toast_notification(title: &str, message: &str) {

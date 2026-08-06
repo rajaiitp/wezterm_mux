@@ -1365,6 +1365,11 @@ impl Client {
         GetPaneRenderableDimensions,
         GetPaneRenderableDimensionsResponse
     );
+    rpc!(
+        get_pane_exit_status,
+        GetPaneExitStatus,
+        GetPaneExitStatusResponse
+    );
     rpc!(get_codec_version, GetCodecVersion, GetCodecVersionResponse);
     rpc!(get_tls_creds, GetTlsCreds = (), GetTlsCredsResponse);
     rpc!(

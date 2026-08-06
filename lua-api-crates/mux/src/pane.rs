@@ -1,7 +1,7 @@
 use super::*;
 use luahelper::mlua::LuaSerdeExt;
 use luahelper::{dynamic_to_lua_value, from_lua, to_lua};
-use mlua::Value;
+use mlua::{UserDataRef, Value};
 use mux::pane::CachePolicy;
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -377,6 +377,25 @@ impl UserData for MuxPane {
             };
             this.get_text_from_semantic_zone(zone)
         });
+
+        methods.add_method(
+            "move_to_tab",
+            |_lua, this, (target, direction): (UserDataRef<MuxTab>, Option<String>)| {
+                let direction = match direction.as_deref() {
+                    Some("left") => mux::tab::SplitDirection::Horizontal,
+                    Some("up") => mux::tab::SplitDirection::Vertical,
+                    Some("right") | Some("down") | None => mux::tab::SplitDirection::Horizontal,
+                    Some(other) => {
+                        return Err(mlua::Error::external(format!(
+                            "invalid move_to_tab direction: {other}"
+                        )))
+                    }
+                };
+                Mux::get()
+                    .move_pane_to_tab(this.0, target.0, direction)
+                    .map_err(|e| mlua::Error::external(format!("{:#?}", e)))
+            },
+        );
 
         methods.add_async_method("move_to_new_tab", |_lua, this, ()| async move {
             let mux = Mux::get();
