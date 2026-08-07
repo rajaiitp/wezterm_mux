@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Legacy terminal-overlay implementation retained as a fallback.
+
 use crate::overlay::quickselect;
 use crate::scripting::guiwin::GuiWin;
 use config::configuration;
@@ -383,7 +385,12 @@ impl SelectorState {
     }
 }
 
-fn trampoline(name: String, window: GuiWin, pane: MuxPane, entry: Option<InputSelectorEntry>) {
+pub(crate) fn trampoline(
+    name: String,
+    window: GuiWin,
+    pane: MuxPane,
+    entry: Option<InputSelectorEntry>,
+) {
     promise::spawn::spawn(async move {
         config::with_lua_config_on_main_thread(move |lua| do_event(lua, name, window, pane, entry))
             .await

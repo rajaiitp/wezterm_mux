@@ -76,6 +76,7 @@ pub mod clipboard;
 pub mod keyevent;
 pub mod modal;
 mod mouseevent;
+pub mod native_modal;
 pub mod palette;
 pub mod paneselect;
 mod prevcursor;
@@ -2320,77 +2321,33 @@ impl TermWindow {
     }
 
     fn show_input_selector(&mut self, args: &config::keyassignment::InputSelector) {
-        let mux = Mux::get();
-        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
-            Some(tab) => tab,
-            None => return,
-        };
-
-        // Ignore any current overlay: we're going to cancel it out below
-        // and we don't want this new one to reference that cancelled pane
-        let pane = match self.get_active_pane_no_overlay() {
-            Some(pane) => pane,
-            None => return,
-        };
-
-        let args = args.clone();
-
-        let gui_win = GuiWin::new(self);
-        let pane = MuxPane(pane.pane_id());
-
-        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
-            crate::overlay::selector::selector(term, args, gui_win, pane)
-        });
-        self.assign_overlay(tab.tab_id(), overlay);
-        promise::spawn::spawn(future).detach();
+        match crate::termwindow::native_modal::NativeInputSelector::new(self, args.clone()) {
+            Ok(modal) => {
+                self.set_modal(Rc::new(modal));
+                self.invalidate_modal();
+            }
+            Err(err) => log::error!("unable to show native InputSelector modal: {err:#}"),
+        }
     }
 
     fn show_prompt_input_line(&mut self, args: &PromptInputLine) {
-        let mux = Mux::get();
-        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
-            Some(tab) => tab,
-            None => return,
-        };
-
-        let pane = match self.get_active_pane_or_overlay() {
-            Some(pane) => pane,
-            None => return,
-        };
-
-        let args = args.clone();
-
-        let gui_win = GuiWin::new(self);
-        let pane = MuxPane(pane.pane_id());
-
-        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
-            crate::overlay::prompt::show_line_prompt_overlay(term, args, gui_win, pane)
-        });
-        self.assign_overlay(tab.tab_id(), overlay);
-        promise::spawn::spawn(future).detach();
+        match crate::termwindow::native_modal::NativePromptInput::new(self, args.clone()) {
+            Ok(modal) => {
+                self.set_modal(Rc::new(modal));
+                self.invalidate_modal();
+            }
+            Err(err) => log::error!("unable to show native PromptInputLine modal: {err:#}"),
+        }
     }
 
     fn show_confirmation(&mut self, args: &Confirmation) {
-        let mux = Mux::get();
-        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
-            Some(tab) => tab,
-            None => return,
-        };
-
-        let pane = match self.get_active_pane_or_overlay() {
-            Some(pane) => pane,
-            None => return,
-        };
-
-        let args = args.clone();
-
-        let gui_win = GuiWin::new(self);
-        let pane = MuxPane(pane.pane_id());
-
-        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
-            crate::overlay::confirm::show_confirmation_overlay(term, args, gui_win, pane)
-        });
-        self.assign_overlay(tab.tab_id(), overlay);
-        promise::spawn::spawn(future).detach();
+        match crate::termwindow::native_modal::NativeConfirmation::new(self, args.clone()) {
+            Ok(modal) => {
+                self.set_modal(Rc::new(modal));
+                self.invalidate_modal();
+            }
+            Err(err) => log::error!("unable to show native Confirmation modal: {err:#}"),
+        }
     }
 
     fn show_debug_overlay(&mut self) {

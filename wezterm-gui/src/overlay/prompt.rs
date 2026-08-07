@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Legacy terminal-overlay implementation retained as a fallback.
+
 use crate::scripting::guiwin::GuiWin;
 use config::keyassignment::{KeyAssignment, PromptInputLine};
 use mux::termwiztermtab::TermWizTerminal;
@@ -74,7 +76,7 @@ pub fn show_line_prompt_overlay(
     Ok(())
 }
 
-fn trampoline(name: String, window: GuiWin, pane: MuxPane, line: Option<String>) {
+pub(crate) fn trampoline(name: String, window: GuiWin, pane: MuxPane, line: Option<String>) {
     promise::spawn::spawn(async move {
         config::with_lua_config_on_main_thread(move |lua| do_event(lua, name, window, pane, line))
             .await

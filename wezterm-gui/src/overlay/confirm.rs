@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Legacy terminal-overlay implementation retained as a fallback.
+
 use crate::scripting::guiwin::GuiWin;
 use config::keyassignment::{Confirmation, KeyAssignment};
 use mux::termwiztermtab::TermWizTerminal;
@@ -176,7 +178,7 @@ pub fn show_confirmation_overlay(
     Ok(())
 }
 
-fn trampoline(name: String, window: GuiWin, pane: MuxPane) {
+pub(crate) fn trampoline(name: String, window: GuiWin, pane: MuxPane) {
     promise::spawn::spawn(async move {
         config::with_lua_config_on_main_thread(move |lua| do_event(lua, name, window, pane)).await
     })
