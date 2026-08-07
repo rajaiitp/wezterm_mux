@@ -24,6 +24,11 @@ pub struct RestoreStateCommand {
     /// Override the workspace stored in the snapshot for all restored windows.
     #[arg(long)]
     workspace: Option<String>,
+
+    /// Remove the snapshot after a successful restore. Used by automatic
+    /// crash/reboot recovery so a stale snapshot is not restored repeatedly.
+    #[arg(long, hide = true)]
+    consume: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +161,18 @@ impl RestoreStateCommand {
                 .await?;
         }
 
+        if self.consume {
+            if let Err(err) = fs::remove_file(&path) {
+                // The restore has already succeeded; do not make the caller
+                // restore a second session merely because cleanup failed.
+                eprintln!(
+                    "warning: restored the snapshot but could not remove {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+
         println!(
             "restored {restored_tabs} tabs and {restored_panes} panes from {}",
             path.display()
@@ -198,10 +215,29 @@ fn restore_command(entry: &PaneEntry, config: &ConfigHandle) -> Option<CommandBu
         editor_restore_command(process)
     } else if is_app(process, &["pi"]) {
         pi_restore_command(process, entry)
+    } else if is_app(process, &["claude", "codex", "tuxedo", "tuicr"]) {
+        recorded_restore_command(process)
     } else {
         return shell_command(config).map(CommandBuilder::from_argv);
     };
     Some(CommandBuilder::from_argv(command))
+}
+
+fn recorded_restore_command(process: &mux::tab::PaneProcessInfo) -> Vec<OsString> {
+    if !process.argv.is_empty() {
+        return process.argv.iter().map(OsString::from).collect();
+    }
+
+    let executable = if process.executable.is_empty() {
+        if process.name.is_empty() {
+            "sh"
+        } else {
+            process.name.as_str()
+        }
+    } else {
+        &process.executable
+    };
+    vec![OsString::from(executable)]
 }
 
 fn editor_restore_command(process: &mux::tab::PaneProcessInfo) -> Vec<OsString> {
@@ -323,7 +359,7 @@ fn latest_pi_session(entry: &PaneEntry, process: &mux::tab::PaneProcessInfo) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::editor_restore_command;
+    use super::{editor_restore_command, recorded_restore_command};
     use mux::tab::PaneProcessInfo;
     use std::path::Path;
 
@@ -358,6 +394,22 @@ mod tests {
         let command = editor_restore_command(&process("", "", &["--embed"]));
         assert_eq!(command, ["nvim"]);
         assert_eq!(Path::new("nvim").file_name().unwrap(), "nvim");
+    }
+
+    #[test]
+    fn preserves_recorded_agent_arguments() {
+        let command = recorded_restore_command(&process(
+            "/opt/homebrew/bin/codex",
+            "codex",
+            &["codex", "--resume", "session-123"],
+        ));
+        assert_eq!(command, ["codex", "--resume", "session-123"]);
+    }
+
+    #[test]
+    fn falls_back_to_recorded_agent_executable() {
+        let command = recorded_restore_command(&process("/usr/local/bin/claude", "", &[]));
+        assert_eq!(command, ["/usr/local/bin/claude"]);
     }
 }
 

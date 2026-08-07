@@ -2,8 +2,12 @@ use anyhow::Context;
 use chrono::Utc;
 use codec::ListPanesResponse;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SNAPSHOT_VERSION: u32 = 1;
 
@@ -54,9 +58,23 @@ pub fn write_atomic(path: &Path, snapshot: &SessionSnapshot) -> anyhow::Result<(
     }
 
     let data = serde_json::to_vec_pretty(snapshot).context("serializing session snapshot")?;
-    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temp_path, data)
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temp_path)
         .with_context(|| format!("writing temporary snapshot {}", temp_path.display()))?;
+    file.write_all(&data)
+        .with_context(|| format!("writing temporary snapshot {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing temporary snapshot {}", temp_path.display()))?;
+    drop(file);
     if let Err(err) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(err).with_context(|| {

@@ -772,7 +772,14 @@ impl SessionHandler {
                                         true,
                                     )
                                 }
-                                None => (None, None, false),
+                                None => match mux.take_exit_status(pane_id) {
+                                    Some(status) => (
+                                        Some(status.exit_code()),
+                                        status.signal().map(str::to_owned),
+                                        false,
+                                    ),
+                                    None => (None, None, false),
+                                },
                             };
                             Ok(Pdu::GetPaneExitStatusResponse(GetPaneExitStatusResponse {
                                 pane_id,

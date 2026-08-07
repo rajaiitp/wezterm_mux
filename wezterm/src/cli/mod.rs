@@ -62,11 +62,18 @@ pub struct CliCommand {
     #[arg(long = "no-auto-start")]
     no_auto_start: bool,
 
-    /// Prefer connecting to a background mux server.
-    /// The default is to prefer connecting to a running
-    /// wezterm gui instance
-    #[arg(long = "prefer-mux")]
+    /// Prefer connecting to a background mux server. Native builds default
+    /// to this so bare CLI commands use the persistent mux.
+    #[arg(
+        long = "prefer-mux",
+        default_value_t = true,
+        conflicts_with = "prefer-gui"
+    )]
     prefer_mux: bool,
+
+    /// Prefer connecting to the GUI socket discovered for --class.
+    #[arg(long = "prefer-gui", conflicts_with = "prefer-mux")]
+    prefer_gui: bool,
 
     /// When connecting to a gui instance, if you started the
     /// gui with `--class SOMETHING`, you should also pass
@@ -192,6 +199,10 @@ Outputs the pane-id for the newly created pane on success"
 }
 
 async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
+    // Load the user configuration before selecting the default Unix domain.
+    // The persistent domain is intentionally the first configured domain, and
+    // bare CLI commands must not fall back to the GUI discovery socket.
+    let config = crate::init_config(opts)?;
     let mut ui = mux::connui::ConnectionUI::new_headless();
     let initial = true;
 
@@ -199,7 +210,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         initial,
         &mut ui,
         cli.no_auto_start,
-        cli.prefer_mux,
+        cli.prefer_mux && !cli.prefer_gui,
         cli.class
             .as_deref()
             .unwrap_or(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS),
@@ -212,8 +223,8 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::SplitPane(cmd) => cmd.run(client).await,
         CliSubCommand::SendText(cmd) => cmd.run(client).await,
         CliSubCommand::GetText(cmd) => cmd.run(client).await,
-        CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
-        CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
+        CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &config).await,
+        CliSubCommand::Proxy(cmd) => cmd.run(client, &config).await,
         CliSubCommand::TlsCreds(cmd) => cmd.run(client).await,
         CliSubCommand::ActivatePaneDirection(cmd) => cmd.run(client).await,
         CliSubCommand::GetPaneDirection(cmd) => cmd.run(client).await,
@@ -226,10 +237,10 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::RenameWorkspace(cmd) => cmd.run(client).await,
         CliSubCommand::ZoomPane(cmd) => cmd.run(client).await,
         CliSubCommand::Wait(cmd) => cmd.run(client).await,
-        CliSubCommand::RunWait(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
+        CliSubCommand::RunWait(cmd) => cmd.run(client, &config).await,
         CliSubCommand::Watch(cmd) => cmd.run(client).await,
         CliSubCommand::SaveState(cmd) => cmd.run(client).await,
-        CliSubCommand::RestoreState(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
+        CliSubCommand::RestoreState(cmd) => cmd.run(client, &config).await,
     }
 }
 

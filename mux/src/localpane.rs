@@ -225,6 +225,10 @@ impl Pane for LocalPane {
     }
 
     fn get_exit_status(&self) -> Option<ExitStatus> {
+        // The child waiter is polled by is_dead(). Querying the status must
+        // perform that poll too; otherwise a hold-on-exit pane can appear
+        // alive forever to `wezterm cli run-wait`.
+        let _ = self.is_dead();
         self.exit_status.lock().clone()
     }
 

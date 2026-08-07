@@ -11,9 +11,8 @@ use wezterm_client::client::Client;
 
 /// Spawn a command in a pane and wait for that pane to exit.
 ///
-/// Completion uses the native mux exit-status RPC when the pane remains long
-/// enough to report it. If the configured exit behavior removes the pane first,
-/// completion is reported with a null exit code.
+/// Completion uses the native mux exit-status RPC, including the short-lived
+/// exit-status cache used when the configured exit behavior removes the pane.
 #[derive(Debug, Parser, Clone)]
 pub struct RunWaitCommand {
     /// Specify the current pane. The pane determines the target window and
@@ -135,6 +134,11 @@ async fn wait_for_completion(
     let started = Instant::now();
     let poll_interval = Duration::from_millis(poll_interval_ms.max(10));
     let timeout = timeout_secs.map(Duration::from_secs);
+    // A pane-removal notification and the exit-status cache update are
+    // delivered on the same mux thread but can be observed by a client in
+    // adjacent polls. Give the cache a short grace period before reporting an
+    // unknown status.
+    let mut missing_status_polls = 0u8;
 
     loop {
         let status = client
@@ -147,11 +151,17 @@ async fn wait_for_completion(
             });
         }
         if !status.is_alive {
+            if missing_status_polls < 5 {
+                missing_status_polls += 1;
+                smol::Timer::after(poll_interval).await;
+                continue;
+            }
             return Ok(Completion {
                 exit_code: None,
                 signal: None,
             });
         }
+        missing_status_polls = 0;
 
         if let Some(timeout) = timeout {
             if started.elapsed() >= timeout {

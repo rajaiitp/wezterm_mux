@@ -332,6 +332,59 @@ impl super::TermWindow {
         self.dragging.replace((item, start_event));
     }
 
+    fn drag_tab(
+        &mut self,
+        mut item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let current_idx = match &item.item_type {
+            UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => *tab_idx,
+            _ => return,
+        };
+
+        // Preserve a normal click when the pointer has barely moved.
+        if (event.coords.x - start_event.coords.x).unsigned_abs() < 4 {
+            self.dragging.replace((item, start_event));
+            return;
+        }
+
+        let target = self
+            .ui_items
+            .iter()
+            .find_map(|ui_item| match &ui_item.item_type {
+                UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. })
+                    if event.coords.x >= ui_item.x as isize
+                        && event.coords.x < ui_item.x.saturating_add(ui_item.width) as isize =>
+                {
+                    Some((*tab_idx, ui_item.x + ui_item.width / 2))
+                }
+                _ => None,
+            });
+
+        if let Some((target_idx, target_center)) = target {
+            let moving_right = target_idx > current_idx;
+            let crossed_target = if moving_right {
+                event.coords.x >= target_center as isize
+            } else {
+                event.coords.x <= target_center as isize
+            };
+
+            if target_idx != current_idx && crossed_target {
+                if self.move_tab(target_idx).is_ok() {
+                    item.item_type = UIItemType::TabBar(TabBarItem::Tab {
+                        tab_idx: target_idx,
+                        active: true,
+                    });
+                    context.invalidate();
+                }
+            }
+        }
+
+        self.dragging.replace((item, start_event));
+    }
+
     fn drag_ui_item(
         &mut self,
         item: UIItem,
@@ -347,6 +400,9 @@ impl super::TermWindow {
             }
             UIItemType::ScrollThumb => {
                 self.drag_scroll_thumb(item, start_event, event, context);
+            }
+            UIItemType::TabBar(TabBarItem::Tab { .. }) => {
+                self.drag_tab(item, start_event, event, context);
             }
             _ => {
                 log::error!("drag not implemented for {:?}", item);
@@ -364,8 +420,8 @@ impl super::TermWindow {
     ) {
         self.last_ui_item.replace(item.clone());
         match item.item_type {
-            UIItemType::TabBar(item) => {
-                self.mouse_event_tab_bar(item, event, context);
+            UIItemType::TabBar(tab_bar_item) => {
+                self.mouse_event_tab_bar(tab_bar_item, item, event, context);
             }
             UIItemType::AboveScrollThumb => {
                 self.mouse_event_above_scroll_thumb(item, pane, event, context);
@@ -456,6 +512,7 @@ impl super::TermWindow {
     pub fn mouse_event_tab_bar(
         &mut self,
         item: TabBarItem,
+        ui_item: UIItem,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
@@ -463,6 +520,7 @@ impl super::TermWindow {
             WMEK::Press(MousePress::Left) => match item {
                 TabBarItem::Tab { tab_idx, .. } => {
                     self.activate_tab(tab_idx as isize).ok();
+                    self.dragging.replace((ui_item, event));
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);

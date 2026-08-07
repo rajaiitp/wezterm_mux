@@ -43,6 +43,15 @@ pub async fn wait_for_pane(
     let timeout = timeout_secs.map(Duration::from_secs);
 
     loop {
+        let status = client
+            .get_pane_exit_status(codec::GetPaneExitStatus { pane_id })
+            .await?;
+        if status.exit_code.is_some() || status.signal.is_some() || !status.is_alive {
+            return Ok(());
+        }
+
+        // A pane may disappear between the status request and the next poll;
+        // treat that as successful completion rather than surfacing a race.
         let panes = client.list_panes().await?;
         if !pane_exists(&panes, pane_id) {
             return Ok(());

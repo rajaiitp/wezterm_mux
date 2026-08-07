@@ -91,18 +91,28 @@ const ATLAS_SIZE: usize = 128;
 
 fn is_client_domain_window(window_id: MuxWindowId) -> bool {
     let mux = Mux::get();
-    let Some(tab) = mux.get_active_tab_for_window(window_id) else {
+    let Some(window) = mux.get_window(window_id) else {
         return false;
     };
-    let Some(pane) = tab.get_active_pane() else {
-        return false;
-    };
-    mux.get_domain(pane.domain_id())
-        .map(|domain| domain.downcast_ref::<ClientDomain>().is_some())
-        .unwrap_or(false)
+    let mut saw_pane = false;
+
+    for tab in window.iter() {
+        for positioned in tab.iter_panes_ignoring_zoom() {
+            saw_pane = true;
+            let is_client = mux
+                .get_domain(positioned.pane.domain_id())
+                .map(|domain| domain.downcast_ref::<ClientDomain>().is_some())
+                .unwrap_or(false);
+            if !is_client {
+                return false;
+            }
+        }
+    }
+
+    saw_pane
 }
 
-fn detach_client_domains() {
+pub(crate) fn detach_client_domains() {
     for domain in Mux::get().iter_domains() {
         if domain.downcast_ref::<ClientDomain>().is_some() {
             if let Err(err) = domain.detach() {
@@ -511,6 +521,8 @@ impl TermWindow {
         // attach to the same live processes afterward.
         if is_client_domain_window(self.mux_window_id) {
             detach_client_domains();
+            window.close();
+            front_end().forget_known_window(window);
             return;
         }
 
@@ -567,6 +579,7 @@ impl TermWindow {
             self.last_mouse_click = None;
             self.current_mouse_buttons.clear();
             self.current_mouse_capture = None;
+            self.dragging = None;
             self.is_click_to_focus_window = false;
 
             for state in self.pane_state.borrow_mut().values_mut() {
@@ -2829,10 +2842,10 @@ impl TermWindow {
                 let mux = Mux::get();
                 let config = &self.config;
                 log::info!("QuitApplication over here (window)");
-                detach_client_domains();
 
                 match config.window_close_confirmation {
                     WindowCloseConfirmation::NeverPrompt => {
+                        detach_client_domains();
                         let con = Connection::get().expect("call on gui thread");
                         con.terminate_message_loop();
                     }

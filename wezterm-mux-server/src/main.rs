@@ -311,7 +311,13 @@ async fn restore_native_snapshot(config: &config::ConfigHandle) -> anyhow::Resul
 
     let output = smol::unblock(move || {
         Command::new(cli)
-            .args(["--no-auto-start", "--prefer-mux", "restore-state"])
+            .args([
+                "cli",
+                "--no-auto-start",
+                "--prefer-mux",
+                "restore-state",
+                "--consume",
+            ])
             .arg("--file")
             .arg(snapshot)
             .env("WEZTERM_UNIX_SOCKET", socket)
@@ -352,12 +358,10 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
         }
     }
 
-    let have_panes_in_domain = mux
-        .iter_panes()
-        .iter()
-        .any(|p| p.domain_id() == domain.domain_id());
-
-    if !have_panes_in_domain {
+    // A snapshot is only a fallback for an empty mux. Checking all windows
+    // avoids duplicating sessions when a non-default domain already owns a
+    // live window.
+    if mux.iter_windows().is_empty() {
         let restored = match restore_native_snapshot(&config).await {
             Ok(restored) => restored,
             Err(err) => {

@@ -102,6 +102,9 @@ static LAST_SUBSCRIBER_ID: AtomicUsize = AtomicUsize::new(0);
 pub struct Mux {
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, Arc<dyn Pane>>>,
+    /// Exit statuses are retained briefly after pane removal so clients such
+    /// as `run-wait` do not lose the result when exit_behavior closes a pane.
+    exit_statuses: RwLock<HashMap<PaneId, (Instant, ExitStatus)>>,
     windows: RwLock<HashMap<WindowId, Window>>,
     default_domain: RwLock<Option<Arc<dyn Domain>>>,
     domains: RwLock<HashMap<DomainId, Arc<dyn Domain>>>,
@@ -311,6 +314,10 @@ fn read_from_pane_pty(
         }
     };
 
+    // Keep a second weak reference so the close-on-exit path can collect the
+    // child status before removing the pane from the mux.
+    let status_pane = pane.clone();
+
     // Spawn parser thread for this pane
     std::thread::spawn({
         let dead = Arc::clone(&dead);
@@ -360,6 +367,18 @@ fn read_from_pane_pty(
             .detach();
         }
         ExitBehavior::Close => {
+            // PTY EOF can arrive just before the child-waiter notification.
+            // Collect the status on this reader thread before asking the mux
+            // to remove the pane, otherwise short-lived commands may appear
+            // to have an unknown result to `run-wait`.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while let Some(pane) = status_pane.upgrade() {
+                if pane.get_exit_status().is_some() || Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
             promise::spawn::spawn_into_main_thread(async move {
                 let mux = Mux::get();
                 mux.remove_pane(pane_id);
@@ -445,6 +464,7 @@ impl Mux {
         Self {
             tabs: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
+            exit_statuses: RwLock::new(HashMap::new()),
             windows: RwLock::new(HashMap::new()),
             default_domain: RwLock::new(default_domain),
             domains_by_name: RwLock::new(domains_by_name),
@@ -775,6 +795,14 @@ impl Mux {
         self.panes.read().get(&pane_id).map(Arc::clone)
     }
 
+    pub fn take_exit_status(&self, pane_id: PaneId) -> Option<ExitStatus> {
+        const CACHE_TTL: Duration = Duration::from_secs(30);
+        let now = Instant::now();
+        let mut statuses = self.exit_statuses.write();
+        statuses.retain(|_, (stored_at, _)| now.duration_since(*stored_at) <= CACHE_TTL);
+        statuses.remove(&pane_id).map(|(_, status)| status)
+    }
+
     pub fn get_tab(&self, tab_id: TabId) -> Option<Arc<Tab>> {
         self.tabs.read().get(&tab_id).map(Arc::clone)
     }
@@ -821,6 +849,27 @@ impl Mux {
         log::debug!("removing pane {}", pane_id);
         let mut changed = false;
         if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
+            let mut exit_status = pane.get_exit_status();
+            if exit_status.is_none() && pane.is_dead() {
+                // The child waiter and PTY reader can publish termination a
+                // few milliseconds apart. This path is only used for a pane
+                // already known to be dead, so a short grace period avoids
+                // losing the status without delaying explicit pane kills.
+                for _ in 0..20 {
+                    std::thread::sleep(Duration::from_millis(1));
+                    exit_status = pane.get_exit_status();
+                    if exit_status.is_some() {
+                        break;
+                    }
+                }
+            }
+            if let Some(status) = exit_status {
+                const CACHE_TTL: Duration = Duration::from_secs(30);
+                let now = Instant::now();
+                let mut statuses = self.exit_statuses.write();
+                statuses.retain(|_, (stored_at, _)| now.duration_since(*stored_at) <= CACHE_TTL);
+                statuses.insert(pane_id, (now, status));
+            }
             log::debug!("killing pane {}", pane_id);
             pane.kill();
             self.notify(MuxNotification::PaneRemoved(pane_id));
