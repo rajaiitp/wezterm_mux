@@ -62,6 +62,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::SequenceNo;
+use wezterm_client::domain::ClientDomain;
 use wezterm_dynamic::Value;
 use wezterm_font::FontConfiguration;
 use wezterm_term::color::ColorPalette;
@@ -87,6 +88,29 @@ use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
 const ATLAS_SIZE: usize = 128;
+
+fn is_client_domain_window(window_id: MuxWindowId) -> bool {
+    let mux = Mux::get();
+    let Some(tab) = mux.get_active_tab_for_window(window_id) else {
+        return false;
+    };
+    let Some(pane) = tab.get_active_pane() else {
+        return false;
+    };
+    mux.get_domain(pane.domain_id())
+        .map(|domain| domain.downcast_ref::<ClientDomain>().is_some())
+        .unwrap_or(false)
+}
+
+fn detach_client_domains() {
+    for domain in Mux::get().iter_domains() {
+        if domain.downcast_ref::<ClientDomain>().is_some() {
+            if let Err(err) = domain.detach() {
+                log::warn!("failed to detach persistent mux domain: {err:#}");
+            }
+        }
+    }
+}
 
 lazy_static::lazy_static! {
     static ref WINDOW_CLASS: Mutex<String> = Mutex::new(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS.to_owned());
@@ -482,6 +506,14 @@ impl TermWindow {
     }
 
     fn close_requested(&mut self, window: &Window) {
+        // Closing a GUI window attached to the persistent mux must detach the
+        // client instead of killing the server-owned panes. A new GUI can
+        // attach to the same live processes afterward.
+        if is_client_domain_window(self.mux_window_id) {
+            detach_client_domains();
+            return;
+        }
+
         let mux = Mux::get();
         match self.config.window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => {
@@ -2797,6 +2829,7 @@ impl TermWindow {
                 let mux = Mux::get();
                 let config = &self.config;
                 log::info!("QuitApplication over here (window)");
+                detach_client_domains();
 
                 match config.window_close_confirmation {
                     WindowCloseConfirmation::NeverPrompt => {

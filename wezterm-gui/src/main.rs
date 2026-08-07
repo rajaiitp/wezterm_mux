@@ -406,6 +406,17 @@ fn cell_pixel_dims(config: &ConfigHandle, dpi: f64) -> anyhow::Result<(usize, us
     ))
 }
 
+fn default_domain_is_unix_client() -> bool {
+    let config = config::configuration();
+    let Some(default_domain) = config.default_domain.as_deref() else {
+        return false;
+    };
+    config
+        .unix_domains
+        .iter()
+        .any(|domain| domain.name == default_domain)
+}
+
 async fn async_run_terminal_gui(
     cmd: Option<CommandBuilder>,
     opts: StartCommand,
@@ -463,9 +474,10 @@ async fn async_run_terminal_gui(
             && opts.workspace.is_none()
             && opts.domain.is_none()
             && Mux::get().iter_windows().is_empty()
+            && !default_domain_is_unix_client()
         {
             match native_session::restore_if_available().await {
-                Ok(true) => log::info!("restored native Herdr session"),
+                Ok(true) => log::info!("restored native session"),
                 Ok(false) => {}
                 Err(err) => log::warn!("native session restore failed: {err:#}"),
             }

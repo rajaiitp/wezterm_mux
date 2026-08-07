@@ -4,8 +4,10 @@ use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
 use mux::Mux;
 use portable_pty::cmdbuilder::CommandBuilder;
+use std::env;
 use std::ffi::OsString;
-use std::process::Command;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
@@ -258,6 +260,75 @@ async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn native_snapshot_path() -> Option<PathBuf> {
+    let state_dir = if let Some(path) = env::var_os("XDG_STATE_HOME") {
+        PathBuf::from(path)
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(env::var_os("HOME")?).join("Library/Application Support")
+    } else {
+        PathBuf::from(env::var_os("HOME")?).join(".local/state")
+    };
+    Some(state_dir.join("wezterm").join("herdr.json"))
+}
+
+async fn restore_native_snapshot(config: &config::ConfigHandle) -> anyhow::Result<bool> {
+    if matches!(
+        env::var("WEZTERM_HERDR_NATIVE_SESSION_RESTORE")
+            .ok()
+            .as_deref(),
+        Some("0" | "false" | "no")
+    ) {
+        return Ok(false);
+    }
+
+    let Some(snapshot) = native_snapshot_path() else {
+        return Ok(false);
+    };
+    if !snapshot.exists() {
+        return Ok(false);
+    }
+
+    let Some(socket) = config
+        .unix_domains
+        .first()
+        .map(|domain| domain.socket_path())
+    else {
+        return Ok(false);
+    };
+    let current = env::current_exe()?;
+    let Some(parent) = current.parent() else {
+        return Ok(false);
+    };
+    let cli = parent.join(if cfg!(windows) {
+        "wezterm.exe"
+    } else {
+        "wezterm"
+    });
+    if !cli.exists() {
+        log::warn!("native snapshot CLI is missing at {}", cli.display());
+        return Ok(false);
+    }
+
+    let output = smol::unblock(move || {
+        Command::new(cli)
+            .args(["--no-auto-start", "--prefer-mux", "restore-state"])
+            .arg("--file")
+            .arg(snapshot)
+            .env("WEZTERM_UNIX_SOCKET", socket)
+            .stdin(Stdio::null())
+            .output()
+    })
+    .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("native snapshot restore failed: {}", stderr.trim());
+    }
+
+    log::info!("restored native session snapshot into persistent mux");
+    Ok(true)
+}
+
 async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
     let mux = Mux::get();
     let config = config::configuration();
@@ -287,15 +358,25 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
         .any(|p| p.domain_id() == domain.domain_id());
 
     if !have_panes_in_domain {
-        let workspace = None;
-        let position = None;
-        let window_id = mux.new_empty_window(workspace, position);
-        domain.attach(Some(*window_id)).await?;
+        let restored = match restore_native_snapshot(&config).await {
+            Ok(restored) => restored,
+            Err(err) => {
+                log::warn!("native snapshot restore failed: {err:#}");
+                false
+            }
+        };
 
-        let _tab = mux
-            .default_domain()
-            .spawn(config.initial_size(0, None), cmd, None, *window_id)
-            .await?;
+        if !restored {
+            let workspace = None;
+            let position = None;
+            let window_id = mux.new_empty_window(workspace, position);
+            domain.attach(Some(*window_id)).await?;
+
+            let _tab = mux
+                .default_domain()
+                .spawn(config.initial_size(0, None), cmd, None, *window_id)
+                .await?;
+        }
     }
     Ok(())
 }
