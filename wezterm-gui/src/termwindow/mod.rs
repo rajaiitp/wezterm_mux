@@ -488,6 +488,8 @@ pub struct TermWindow {
 
     ui_items: Vec<UIItem>,
     dragging: Option<(UIItem, MouseEvent)>,
+    drag_start_split: Option<PositionedSplit>,
+    drag_start_pointer: Option<(usize, i64)>,
 
     modal: RefCell<Option<Rc<dyn Modal>>>,
 
@@ -843,6 +845,8 @@ impl TermWindow {
             semantic_zones: HashMap::new(),
             ui_items: vec![],
             dragging: None,
+            drag_start_split: None,
+            drag_start_pointer: None,
             last_ui_item: None,
             is_click_to_focus_window: false,
             key_table_state: KeyTableState::default(),
@@ -2958,8 +2962,7 @@ impl TermWindow {
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
                     self.copy_to_clipboard(*dest, text);
-                    let window = self.window.as_ref().unwrap();
-                    window.invalidate();
+                    self.clear_selection(pane);
                 } else {
                     self.do_open_link_at_mouse_cursor(pane);
                 }
@@ -2968,9 +2971,10 @@ impl TermWindow {
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
                     self.copy_to_clipboard(*dest, text);
-                    let window = self.window.as_ref().unwrap();
-                    window.invalidate();
                 }
+                // Mouse-up completion copies first, then removes the visual
+                // highlight so a released selection never remains selected.
+                self.clear_selection(pane);
             }
             ClearScrollback(erase_mode) => {
                 pane.erase_scrollback(*erase_mode);

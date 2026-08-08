@@ -219,6 +219,11 @@ impl<L, N> Cursor<L, N> {
         matches!(&*self.it, Tree::Leaf(_))
     }
 
+    /// Returns the subtree at the current cursor position.
+    pub fn current_tree(&self) -> &Tree<L, N> {
+        &self.it
+    }
+
     /// Returns true if the current position is the left child of its parent
     pub fn is_left(&self) -> bool {
         matches!(&*self.path, Path::Left { .. })

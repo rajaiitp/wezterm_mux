@@ -40,10 +40,22 @@ export default function (pi) {
   };
 
   const updateStatus = (connected: boolean, reason?: string) => {
-    if (connected) {
-      ctxRef?.ui.setStatus(EXTENSION_ID, "wezterm: connected");
-    } else {
-      ctxRef?.ui.setStatus(EXTENSION_ID, reason ? `wezterm: ${reason}` : "wezterm: disconnected");
+    const ctx = ctxRef;
+    if (!ctx) return;
+
+    try {
+      ctx.ui.setStatus(
+        EXTENSION_ID,
+        connected ? "wezterm: connected" : reason ? `wezterm: ${reason}` : "wezterm: disconnected",
+      );
+    } catch (error) {
+      // Socket callbacks can arrive after Pi replaces or reloads the session.
+      // Never let a late callback use the retired extension context.
+      if (error instanceof Error && error.message.includes("This extension ctx is stale")) {
+        if (ctxRef === ctx) ctxRef = undefined;
+        return;
+      }
+      throw error;
     }
   };
 
@@ -87,29 +99,38 @@ export default function (pi) {
   const connect = async (ctx) => {
     ctxRef = ctx;
     if (client?.connected) return client;
-    client = new AutomationClient({
+    let nextClient;
+    nextClient = new AutomationClient({
       socketPath: SOCKET,
       paneId: PANE_ID,
       clientName: "pi",
       clientVersion: "0.1.0",
-      onConnectionChange: updateStatus,
+      onConnectionChange: (connected, reason) => {
+        // Ignore callbacks from a socket belonging to a replaced/reloaded session.
+        if (client !== nextClient) return;
+        updateStatus(connected, reason);
+      },
       onClientCall,
       onEvent: (event) => {
+        if (client !== nextClient) return;
         if (event?.event === "pane.removed" && event.data?.paneId === PANE_ID) {
-          client?.disconnect();
+          nextClient.disconnect();
         }
       },
     });
+    client = nextClient;
     try {
-      await client.connect();
-      await client.subscribe();
+      await nextClient.connect();
+      await nextClient.subscribe();
       updateStatus(true);
       publishState();
-      return client;
+      return nextClient;
     } catch (error) {
       updateStatus(false, error instanceof Error ? error.message : String(error));
-      client.disconnect();
-      client = undefined;
+      if (client === nextClient) {
+        nextClient.disconnect();
+        client = undefined;
+      }
       return undefined;
     }
   };
@@ -349,8 +370,10 @@ export default function (pi) {
     }
   });
 
-  pi.on("session_shutdown", (_event, ctx) => {
-    ctxRef = ctx;
+  pi.on("session_shutdown", () => {
+    // Invalidate the context before closing the socket: its close callback may
+    // run after this extension instance has been retired.
+    ctxRef = undefined;
     currentState.phase = "idle";
     publishState();
     client?.disconnect();

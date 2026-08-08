@@ -129,9 +129,18 @@ impl super::TermWindow {
                     // Completed a window drag
                     return;
                 }
-                if press == &MousePress::Left && self.dragging.take().is_some() {
-                    // Completed a drag
-                    return;
+                if press == &MousePress::Left {
+                    if let Some((item, _start_event)) = self.dragging.take() {
+                        if let UIItemType::Split(split) = item.item_type {
+                            // Split dragging is intentionally committed only on
+                            // release. This avoids resize feedback from async
+                            // mux updates while the pointer is still moving.
+                            self.commit_drag_split(split, x, y, context);
+                        }
+                        self.drag_start_split = None;
+                        self.drag_start_pointer = None;
+                        return;
+                    }
                 }
             }
 
@@ -180,7 +189,7 @@ impl super::TermWindow {
                 }
 
                 if let Some((item, start_event)) = self.dragging.take() {
-                    self.drag_ui_item(item, start_event, x, y, event, context);
+                    self.drag_ui_item(item, start_event, event, context);
                     return;
                 }
             }
@@ -220,7 +229,7 @@ impl super::TermWindow {
             if capture_mouse {
                 self.current_mouse_capture = Some(MouseCapture::UI);
             }
-            self.mouse_event_ui_item(item, pane, y, event, context);
+            self.mouse_event_ui_item(item, pane, x, y, event, context);
         } else if matches!(
             self.current_mouse_capture,
             None | Some(MouseCapture::TerminalPane(_))
@@ -251,11 +260,9 @@ impl super::TermWindow {
         context.invalidate();
     }
 
-    fn drag_split(
+    fn commit_drag_split(
         &mut self,
-        mut item: UIItem,
         split: PositionedSplit,
-        start_event: MouseEvent,
         x: usize,
         y: i64,
         context: &dyn WindowOps,
@@ -265,19 +272,36 @@ impl super::TermWindow {
             Some(tab) => tab,
             None => return,
         };
-        let delta = match split.direction {
-            SplitDirection::Horizontal => (x as isize).saturating_sub(split.left as isize),
-            SplitDirection::Vertical => (y as isize).saturating_sub(split.top as isize),
+        // Anchor the drag to the split and pointer position at press time.
+        // Using the current divider position as the origin lets asynchronous
+        // pane resize/resync events feed back into the next touchpad event,
+        // which makes the divider visibly jiggle.
+        let start_split = self.drag_start_split.unwrap_or(split);
+        // `x`/`y` are cell coordinates, while MouseEvent::coords are pixels.
+        // Keep the press position in the same coordinate system so the first
+        // motion event cannot turn a normal drag into a large jump.
+        let (start_x, start_y) = self.drag_start_pointer.unwrap_or((x, y));
+        let pointer_delta = match split.direction {
+            SplitDirection::Horizontal => (x as isize).saturating_sub(start_x as isize),
+            SplitDirection::Vertical => {
+                y.saturating_sub(start_y)
+                    .clamp(isize::MIN as i64, isize::MAX as i64) as isize
+            }
         };
+        let desired_position = match split.direction {
+            SplitDirection::Horizontal => (start_split.left as isize).saturating_add(pointer_delta),
+            SplitDirection::Vertical => (start_split.top as isize).saturating_add(pointer_delta),
+        };
+        let current_position = match split.direction {
+            SplitDirection::Horizontal => split.left as isize,
+            SplitDirection::Vertical => split.top as isize,
+        };
+        let delta = desired_position.saturating_sub(current_position);
 
         if delta != 0 {
             tab.resize_split_by(split.index, delta);
-            if let Some(split) = tab.iter_splits().into_iter().nth(split.index) {
-                item.item_type = UIItemType::Split(split);
-                context.invalidate();
-            }
+            context.invalidate();
         }
-        self.dragging.replace((item, start_event));
     }
 
     fn drag_scroll_thumb(
@@ -389,14 +413,14 @@ impl super::TermWindow {
         &mut self,
         item: UIItem,
         start_event: MouseEvent,
-        x: usize,
-        y: i64,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         match item.item_type {
-            UIItemType::Split(split) => {
-                self.drag_split(item, split, start_event, x, y, context);
+            UIItemType::Split(_) => {
+                // Keep the original divider and pointer position alive until
+                // release; resizing during motion causes feedback/jitter.
+                self.dragging.replace((item, start_event));
             }
             UIItemType::ScrollThumb => {
                 self.drag_scroll_thumb(item, start_event, event, context);
@@ -414,7 +438,8 @@ impl super::TermWindow {
         &mut self,
         item: UIItem,
         pane: Arc<dyn Pane>,
-        _y: i64,
+        x: usize,
+        y: i64,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
@@ -433,7 +458,7 @@ impl super::TermWindow {
                 self.mouse_event_below_scroll_thumb(item, pane, event, context);
             }
             UIItemType::Split(split) => {
-                self.mouse_event_split(item, split, event, context);
+                self.mouse_event_split(item, split, x, y, event, context);
             }
             UIItemType::CloseTab(idx) => {
                 self.mouse_event_close_tab(idx, event, context);
@@ -697,6 +722,8 @@ impl super::TermWindow {
         &mut self,
         item: UIItem,
         split: PositionedSplit,
+        x: usize,
+        y: i64,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
@@ -706,6 +733,8 @@ impl super::TermWindow {
         }));
 
         if event.kind == WMEK::Press(MousePress::Left) {
+            self.drag_start_split = Some(split);
+            self.drag_start_pointer = Some((x, y));
             self.dragging.replace((item, event));
         }
     }
