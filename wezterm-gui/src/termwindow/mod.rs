@@ -1321,27 +1321,37 @@ impl TermWindow {
                     let mux = Mux::get();
                     let mut size = self.terminal_size;
                     if let Some(tab) = mux.get_tab(tab_id) {
-                        // If we attached to a remote domain and loaded in
-                        // a tab async, we need to fixup its size, either
-                        // by resizing it or resizes ourselves.
-                        // The strategy here is to adjust both by taking
-                        // the maximal size in both horizontal and vertical
-                        // dimensions and applying that. In practice that
-                        // means that a new local client will resize larger
-                        // to adjust to the size of an existing client.
                         let tab_size = tab.get_size();
-                        size.rows = size.rows.max(tab_size.rows);
-                        size.cols = size.cols.max(tab_size.cols);
+                        if !self.window_state.can_resize() {
+                            // Tiling compositors own the window geometry. A
+                            // restored tab can still carry the old full-screen
+                            // cell size; never let that stale size grow a
+                            // half-screen window back to its previous width.
+                            if tab_size != self.terminal_size {
+                                log::debug!(
+                                    "syncing restored tab {} to compositor-owned size {:?}",
+                                    tab_id,
+                                    self.terminal_size
+                                );
+                                tab.resize(self.terminal_size);
+                            }
+                        } else {
+                            // If we attached to a remote domain and loaded in
+                            // a tab async, fix up either the tab or the window
+                            // using the larger of the two known dimensions.
+                            size.rows = size.rows.max(tab_size.rows);
+                            size.cols = size.cols.max(tab_size.cols);
 
-                        if size.rows != self.terminal_size.rows
-                            || size.cols != self.terminal_size.cols
-                            || size.pixel_width != self.terminal_size.pixel_width
-                            || size.pixel_height != self.terminal_size.pixel_height
-                        {
-                            self.set_window_size(size, window)?;
-                        } else if tab_size.dpi == 0 {
-                            log::debug!("fixup dpi in newly added tab");
-                            tab.resize(self.terminal_size);
+                            if size.rows != self.terminal_size.rows
+                                || size.cols != self.terminal_size.cols
+                                || size.pixel_width != self.terminal_size.pixel_width
+                                || size.pixel_height != self.terminal_size.pixel_height
+                            {
+                                self.set_window_size(size, window)?;
+                            } else if tab_size.dpi == 0 {
+                                log::debug!("fixup dpi in newly added tab");
+                                tab.resize(self.terminal_size);
+                            }
                         }
                     }
                 }
@@ -1385,6 +1395,7 @@ impl TermWindow {
                     }
                 }
                 MuxNotification::PaneAdded(_)
+                | MuxNotification::PaneExited(_, _)
                 | MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
@@ -1541,7 +1552,8 @@ impl TermWindow {
             }
             | MuxNotification::PaneFocused(pane_id)
             | MuxNotification::PaneRemoved(pane_id)
-            | MuxNotification::PaneOutput(pane_id) => {
+            | MuxNotification::PaneOutput(pane_id)
+            | MuxNotification::PaneExited(pane_id, _) => {
                 // Check window validity and propagate to the window event handler
                 // that will do the full pane visibility check.
                 let mux = Mux::get();

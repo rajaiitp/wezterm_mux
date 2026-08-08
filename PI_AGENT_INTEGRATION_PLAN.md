@@ -696,40 +696,38 @@ an operation is unavailable during the current streaming state.
 Avoid one tool per low-level operation. Register a small coherent set with
 strict discriminated schemas:
 
-1. `terminal_context`
-   - topology and focused context;
-   - neighboring panes and attached Pi sessions.
+1. `terminal_run`
+   - start a command in an idle pane from a fixed three-pane side-panel pool;
+   - return only an opaque command ref.
 2. `terminal_read`
-   - viewport, scrollback, semantic zones, process metadata, subscriptions.
-3. `terminal_control`
-   - focus, split, resize, zoom, move, tab/workspace/domain operations.
-4. `terminal_run`
-   - managed commands, waiting, cancellation, output retrieval.
-5. `terminal_ui`
-   - notifications, selectors, confirmations, scratch panes, highlights.
-6. `terminal_input`
-   - explicit text/key/raw input operations.
+   - read the retained response buffer by command ref.
+3. `terminal_command`
+   - inspect, interrupt, or explicitly close by command ref.
+4. `terminal_input`
+   - interact with the managed shell by command ref.
 
-`terminal_input` remains separate so prompts and policy can clearly distinguish
-semantic orchestration from input injection, even though this installation
-grants it by default.
+Pane, tab, and window refs never enter the Pi tool schema or command results;
+the mux plugin owns that mapping.
 
-### 7.6 Context injection
+The pool is finite and user-visible: the mux plugin creates the first side
+panel during Pi's automation handshake in the origin tab, then later commands
+create at most two stacked siblings inside it. Completed commands leave their
+shells and output in place; later commands reuse idle panes. A pane moved out of
+the origin tab is never reused for another Pi command, and Pi may explicitly
+close managed panes.
 
-Use `before_agent_start` to inject a compact terminal context message:
+### 7.6 Context and callbacks
 
-- origin pane and workspace;
-- focused pane if different;
-- current layout summary;
-- recent semantic command state;
-- active managed commands;
-- available Pi sessions in neighboring panes.
+Do not inject mux topology into every Pi turn. The integration starts with only
+its own pane binding and connection status. Pi calls `terminal_read` for a
+specific pane only when it needs output or metadata.
 
-Do not inject complete scrollback or every output event. Pi should call
-`terminal_read` when it needs details.
-
-Track topology revisions so only relevant changes are injected on subsequent
-turns.
+Managed commands run in a persistent shell pane. The managed shell installs a
+prompt hook that reports each command's exit status through a private callback
+FIFO; WezTerm then emits `command.finished` with the command ref, exit code, and
+success flag. Nothing is printed into the terminal for protocol purposes. This
+is event-driven—there is no command polling loop. The pane and its response
+buffer remain available for inspection or interaction until explicitly closed.
 
 ### 7.7 Extension UI
 

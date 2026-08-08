@@ -114,8 +114,12 @@ fn capture_mux() -> ListPanesResponse {
     let mut tabs = vec![];
     let mut tab_titles = vec![];
     let mut window_titles = std::collections::HashMap::new();
+    let mut active_tabs = std::collections::HashMap::new();
     for window_id in mux.iter_windows() {
         if let Some(window) = mux.get_window(window_id) {
+            if let Some(tab) = window.get_active() {
+                active_tabs.insert(window_id, tab.tab_id());
+            }
             window_titles.insert(window_id, window.get_title().to_string());
             for tab in window.iter() {
                 tabs.push(tab.codec_pane_tree());
@@ -127,6 +131,7 @@ fn capture_mux() -> ListPanesResponse {
         tabs,
         tab_titles,
         window_titles,
+        active_tabs,
     }
 }
 

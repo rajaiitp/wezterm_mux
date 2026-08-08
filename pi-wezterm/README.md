@@ -18,7 +18,13 @@ new panes.
 
 ## Tools
 
-The extension exposes `terminal_context`, `terminal_read`, `terminal_control`,
-`terminal_run`, `terminal_command`, and `terminal_input`. All operations use
-the native typed JSON-RPC socket; no `wezterm cli` subprocesses or screen
-scraping are used.
+The extension exposes a small command interface: `terminal_run`,
+`terminal_read`, `terminal_command`, and `terminal_input`. Pi sees only opaque
+command IDs and command output; pane, tab, and window identity stays inside the
+mux plugin. Each Pi pane owns a fixed pool of up to three visible command
+panes: one side panel, then stacked panes within it. Commands reuse idle shell
+panes instead of opening or closing panes repeatedly. Completion is an event
+callback, not a polling loop; panes remain visible, readable, and interactive.
+The extension does not inject a full mux/topology snapshot into Pi context. All
+operations use the native typed JSON-RPC socket; no `wezterm cli` subprocesses
+or screen scraping are used.

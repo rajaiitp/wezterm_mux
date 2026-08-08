@@ -56,6 +56,9 @@ pub const DEFAULT_WORKSPACE: &str = "default";
 #[derive(Clone, Debug)]
 pub enum MuxNotification {
     PaneOutput(PaneId),
+    /// The pane's child process has produced a final exit status. The pane
+    /// may remain visible when exit_behavior is Hold.
+    PaneExited(PaneId, ExitStatus),
     PaneAdded(PaneId),
     PaneRemoved(PaneId),
     WindowCreated(WindowId),

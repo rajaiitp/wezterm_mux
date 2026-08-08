@@ -273,6 +273,7 @@ impl Pane for LocalPane {
 
     fn is_dead(&self) -> bool {
         let mut proc = self.process.lock();
+        let mut exited = None;
 
         const EXIT_BEHAVIOR: &str = "This message is shown because \
             \x1b]8;;https://wezterm.org/\
@@ -298,6 +299,7 @@ impl Pane for LocalPane {
 
                 if let Some(status) = status {
                     self.exit_status.lock().replace(status.clone());
+                    exited = Some(status.clone());
                     let success = match status.success() {
                         true => true,
                         false => configuration()
@@ -374,11 +376,16 @@ impl Pane for LocalPane {
             emit_output_for_pane(self.pane_id, &notify);
         }
 
-        match &*proc {
+        let dead = match &*proc {
             ProcessState::Running { .. } => false,
             ProcessState::DeadPendingClose { .. } => false,
             ProcessState::Dead => true,
+        };
+        drop(proc);
+        if let Some(status) = exited {
+            Mux::notify_from_any_thread(MuxNotification::PaneExited(self.pane_id, status));
         }
+        dead
     }
 
     fn set_clipboard(&self, clipboard: &Arc<dyn Clipboard>) {

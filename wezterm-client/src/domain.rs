@@ -507,6 +507,7 @@ impl ClientDomain {
         mut primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
+        let active_tabs = panes.active_tabs.clone();
         log::debug!(
             "domain {}: ListPanes result {:#?}",
             inner.local_domain_id,
@@ -701,6 +702,24 @@ impl ClientDomain {
             let mut panes = inner.remote_to_local_pane.lock().unwrap();
             for p in remote_panes_to_forget {
                 panes.remove(&p);
+            }
+        }
+
+        // The remote mux owns the authoritative active-tab state. Restore it
+        // before gui-attached is emitted so a newly attached GUI never paints
+        // the first tab and then visibly jumps to the saved tab.
+        for (remote_window_id, remote_tab_id) in active_tabs {
+            let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) else {
+                continue;
+            };
+            let Some(local_tab_id) = inner.remote_to_local_tab_id(remote_tab_id) else {
+                continue;
+            };
+            let Some(mut window) = mux.get_window_mut(local_window_id) else {
+                continue;
+            };
+            if let Some(index) = window.idx_by_id(local_tab_id) {
+                window.set_active_without_saving(index);
             }
         }
 
@@ -938,10 +957,19 @@ impl Domain for ClientDomain {
         let config = self.config.clone();
 
         let activity = mux::activity::Activity::new();
-        let ui = ConnectionUI::with_params(ConnectionUIParams {
-            window_id,
-            ..Default::default()
-        });
+        let ui = match &config {
+            // A live local socket means the persistent mux is ready; attach
+            // without painting a temporary "Connecting..." terminal.
+            // If the socket is absent, keep the visible UI so a startup failure
+            // is diagnosable instead of silently disappearing.
+            ClientDomainConfig::Unix(unix) if unix.socket_path().exists() => {
+                ConnectionUI::new_headless()
+            }
+            _ => ConnectionUI::with_params(ConnectionUIParams {
+                window_id,
+                ..Default::default()
+            }),
+        };
         ui.title("wezterm: Connecting...");
 
         ui.async_run_and_log_error({

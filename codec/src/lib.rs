@@ -649,6 +649,10 @@ pub struct ListPanesResponse {
     pub tabs: Vec<PaneNode>,
     pub tab_titles: Vec<String>,
     pub window_titles: HashMap<WindowId, String>,
+    /// The tab selected in each remote mux window. Older servers may omit this
+    /// field, in which case the client keeps its default tab selection.
+    #[serde(default)]
+    pub active_tabs: HashMap<WindowId, TabId>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

@@ -53,6 +53,7 @@ impl RestoreStateCommand {
             tabs,
             tab_titles,
             window_titles,
+            ..
         } = snapshot.mux;
         let mut window_ids = HashMap::<WindowId, WindowId>::new();
         let mut focused_pane = None;

@@ -17,8 +17,16 @@ use promise::spawn::spawn_into_main_thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::ffi::{CStr, CString, OsString};
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -30,6 +38,24 @@ pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 const MAIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_MANAGED_PANES: usize = 3;
+
+#[derive(Clone, Debug)]
+struct ManagedCommand {
+    pane_id: PaneId,
+    owner_client_id: Option<String>,
+    running: bool,
+    exit_code: Option<i32>,
+    signal: Option<String>,
+    success: Option<bool>,
+    reason: Option<String>,
+}
+
+struct ManagedShellSetup {
+    command: CommandBuilder,
+    callback_fifo: PathBuf,
+    cleanup_dir: PathBuf,
+}
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -97,6 +123,9 @@ lazy_static::lazy_static! {
     static ref CLIENTS: Mutex<HashMap<String, mpsc::SyncSender<String>>> = Mutex::new(HashMap::new());
     static ref CLIENT_STATES: Mutex<HashMap<String, Value>> = Mutex::new(HashMap::new());
     static ref CLIENT_ORIGINS: Mutex<HashMap<String, Option<PaneId>>> = Mutex::new(HashMap::new());
+    static ref MANAGED_PANES: Mutex<HashMap<PaneId, Vec<PaneId>>> = Mutex::new(HashMap::new());
+    static ref MANAGED_COMMANDS: Mutex<HashMap<String, ManagedCommand>> = Mutex::new(HashMap::new());
+    static ref SHELL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 }
 
 /// Derive a sibling endpoint from the configured mux socket.
@@ -325,6 +354,11 @@ fn dispatch_request(
             .unwrap()
             .insert(client_id.clone(), origin_pane);
 
+        // Panel creation is intentionally demand-driven: hello only binds Pi
+        // to its origin pane. `command.run` creates the first side panel when
+        // Pi actually needs to run something.
+        let managed_panel = Value::Null;
+
         send_result(
             out,
             id,
@@ -334,6 +368,7 @@ fn dispatch_request(
                 "muxInstanceId": &*INSTANCE_ID,
                 "epoch": std::process::id(),
                 "originPaneId": origin_pane,
+                "managedPanel": managed_panel,
                 "grantedCapabilities": capabilities(),
                 "features": {
                     "topologySnapshot": true,
@@ -342,6 +377,8 @@ fn dispatch_request(
                     "semanticZones": true,
                     "paneControl": true,
                     "managedCommands": true,
+                    "managedPanel": true,
+                    "managedPaneLimit": MAX_MANAGED_PANES,
                     "clientCallbacks": true,
                     "sshDomains": true,
                     "sshRelay": "native-mux-domain"
@@ -469,34 +506,56 @@ fn dispatch_request(
             )
         }
         "pane.sendText" | "pane.focus" | "pane.close" | "pane.setZoomed" | "pane.split"
-        | "command.run" | "command.cancel" | "workspace.rename" | "tab.focus" => {
+        | "command.run" | "command.cancel" | "command.input" | "command.close" | "panel.ensure"
+        | "workspace.rename" | "tab.focus" => {
             let method = request.method;
-            let params = request.params.unwrap_or_else(|| json!({}));
+            let mut params = request.params.unwrap_or_else(|| json!({}));
+            if method == "command.run" {
+                if let (Some(client_id), Some(object)) =
+                    (state.client_id.clone(), params.as_object_mut())
+                {
+                    // Completion callbacks are delivered only to the client
+                    // that launched the command, not every Pi pane.
+                    object.insert("ownerClientId".to_string(), json!(client_id));
+                }
+            }
             let result = run_mutation_on_main(method, params);
             match result {
                 Ok(value) => send_result(out, id, value),
                 Err(err) => send_error(out, id, -32010, &err.to_string(), None),
             }
         }
-        "command.getResult" => {
+        "command.read" => {
             let params = object_params(request.params)?;
-            let pane_id = command_pane_id(&params)?;
-            let pane = Mux::get()
-                .get_pane(pane_id)
-                .ok_or_else(|| anyhow!("pane {pane_id} not found"))?;
-            let status = pane.get_exit_status();
+            let command_id = managed_command_id(&params)?;
+            let record = MANAGED_COMMANDS
+                .lock()
+                .unwrap()
+                .get(&command_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("command {command_id} not found"))?;
+            let start = params.get("start").and_then(Value::as_i64);
+            let end = params.get("end").and_then(Value::as_i64);
+            let output = pane_text(record.pane_id, start, end)?
+                .get("text")
+                .cloned()
+                .unwrap_or(Value::String(String::new()));
             send_result(
                 out,
                 id,
-                json!({
-                    "commandId": format!("command-{pane_id}"),
-                    "paneId": pane_id,
-                    "running": status.is_none() && !pane.is_dead(),
-                    "exitCode": status.as_ref().map(|status| status.exit_code()),
-                    "signal": status.as_ref().and_then(|status| status.signal()),
-                    "success": status.as_ref().map(|status| status.success())
-                }),
+                json!({ "commandId": command_id, "output": output }),
             )
+        }
+        "command.getResult" => {
+            let params = object_params(request.params)?;
+            let command_id = managed_command_id(&params)?;
+            let record = MANAGED_COMMANDS
+                .lock()
+                .unwrap()
+                .get(&command_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("command {command_id} not found"))?;
+            send_result(out, id, managed_command_result(&command_id, &record))
         }
         "client.callback_result" => {}
         "automation.ping" => send_result(
@@ -526,10 +585,13 @@ fn capabilities() -> Vec<&'static str> {
         "pane.create",
         "pane.layout",
         "pane.close",
+        "panel.manage",
         "tab.control",
         "workspace.control",
         "command.run",
         "command.cancel",
+        "command.input",
+        "command.close",
         "client.callback",
     ]
 }
@@ -549,19 +611,33 @@ fn pane_id(params: &Map<String, Value>) -> anyhow::Result<PaneId> {
         .ok_or_else(|| anyhow!("paneId is required"))
 }
 
-fn command_pane_id(params: &Map<String, Value>) -> anyhow::Result<PaneId> {
-    if let Some(pane_id) = params.get("paneId").and_then(Value::as_u64) {
-        return Ok(pane_id as PaneId);
+fn managed_command_id(params: &Map<String, Value>) -> anyhow::Result<String> {
+    if let Some(command_id) = params.get("commandId").and_then(Value::as_str) {
+        return Ok(command_id.to_string());
     }
-    let command_id = params
-        .get("commandId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("paneId or commandId is required"))?;
-    command_id
-        .strip_prefix("command-")
-        .ok_or_else(|| anyhow!("invalid commandId"))?
-        .parse::<PaneId>()
-        .map_err(|_| anyhow!("invalid commandId"))
+    let pane_id = params
+        .get("paneId")
+        .and_then(Value::as_u64)
+        .map(|id| id as PaneId)
+        .ok_or_else(|| anyhow!("commandId or paneId is required"))?;
+    MANAGED_COMMANDS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, command)| command.pane_id == pane_id && command.running)
+        .map(|(command_id, _)| command_id.clone())
+        .ok_or_else(|| anyhow!("no running command is attached to pane {pane_id}"))
+}
+
+fn managed_command_result(command_id: &str, command: &ManagedCommand) -> Value {
+    json!({
+        "commandId": command_id,
+        "running": command.running,
+        "exitCode": command.exit_code,
+        "signal": command.signal,
+        "success": command.success,
+        "reason": command.reason,
+    })
 }
 
 fn send_result(out: &mpsc::SyncSender<String>, id: Value, result: Value) {
@@ -633,6 +709,15 @@ fn subscribe_topology(
 fn notification_to_event(notification: MuxNotification, revision: u64) -> EventNotification {
     let (kind, data) = match notification {
         MuxNotification::PaneOutput(pane_id) => ("pane.output", json!({ "paneId": pane_id })),
+        MuxNotification::PaneExited(pane_id, status) => (
+            "pane.exited",
+            json!({
+                "paneId": pane_id,
+                "exitCode": status.exit_code(),
+                "signal": status.signal(),
+                "success": status.success()
+            }),
+        ),
         MuxNotification::PaneAdded(pane_id) => ("pane.added", json!({ "paneId": pane_id })),
         MuxNotification::PaneRemoved(pane_id) => ("pane.removed", json!({ "paneId": pane_id })),
         MuxNotification::PaneFocused(pane_id) => ("pane.focused", json!({ "paneId": pane_id })),
@@ -817,10 +902,15 @@ fn pane_text(pane_id: PaneId, start: Option<i64>, end: Option<i64>) -> anyhow::R
         .get_pane(pane_id)
         .ok_or_else(|| anyhow!("pane {pane_id} not found"))?;
     let dims = pane.get_dimensions();
-    let start = start.unwrap_or(dims.physical_top as i64) as StableRowIndex;
-    let end = end
-        .unwrap_or(start as i64 + dims.viewport_rows as i64)
-        .max(start as i64) as StableRowIndex;
+    // A command's response buffer is the recent retained scrollback, not
+    // merely whatever happens to be visible in the pane. Explicit ranges can
+    // still be used for older or very large output.
+    let default_end = dims.physical_top + dims.viewport_rows as StableRowIndex;
+    let end = end.unwrap_or(default_end as i64) as StableRowIndex;
+    let start = start
+        .map(|value| value as StableRowIndex)
+        .unwrap_or_else(|| end.saturating_sub(4096).max(dims.scrollback_top));
+    let end = end.max(start);
     let span = (end - start).max(0) as usize;
     anyhow::ensure!(span <= 4096, "requested text range is too large");
     let (first, lines) = pane.get_lines(start..end);
@@ -933,14 +1023,64 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
             Ok(json!({ "closed": true, "paneId": pane_id }))
         }
         "command.cancel" => {
-            let pane_id = command_pane_id(&params)?;
+            let command_id = managed_command_id(&params)?;
+            let record = MANAGED_COMMANDS
+                .lock()
+                .unwrap()
+                .get(&command_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("command {command_id} not found"))?;
             let pane = mux
-                .get_pane(pane_id)
-                .ok_or_else(|| anyhow!("pane {pane_id} not found"))?;
-            pane.kill();
-            Ok(
-                json!({ "cancelled": true, "commandId": format!("command-{pane_id}"), "paneId": pane_id }),
-            )
+                .get_pane(record.pane_id)
+                .ok_or_else(|| anyhow!("pane {} not found", record.pane_id))?;
+            // Interrupt the command inside its persistent shell. Do not kill
+            // the shell or close the pane; it remains available for reuse and
+            // for direct user interaction.
+            if record.running {
+                // The managed shell's prompt hook reports the resulting 130
+                // status through the callback FIFO once Ctrl-C returns it to
+                // the prompt. The shell and pane remain reusable.
+                pane.send_paste("\u{3}")?;
+            }
+            Ok(json!({
+                "cancelled": record.running,
+                "commandId": command_id,
+                "paneId": record.pane_id
+            }))
+        }
+        "command.input" => {
+            let command_id = managed_command_id(&params)?;
+            let text = params
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("text is required"))?;
+            anyhow::ensure!(text.len() <= MAX_TEXT_BYTES, "input is too large");
+            let record = MANAGED_COMMANDS
+                .lock()
+                .unwrap()
+                .get(&command_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("command {command_id} not found"))?;
+            let pane = mux
+                .get_pane(record.pane_id)
+                .ok_or_else(|| anyhow!("command pane is no longer available"))?;
+            pane.send_paste(text)?;
+            Ok(json!({ "commandId": command_id, "sent": text.len() }))
+        }
+        "command.close" => {
+            let command_id = managed_command_id(&params)?;
+            let record = MANAGED_COMMANDS
+                .lock()
+                .unwrap()
+                .get(&command_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("command {command_id} not found"))?;
+            anyhow::ensure!(
+                mux.get_pane(record.pane_id).is_some(),
+                "command pane is already closed"
+            );
+            mux.remove_pane(record.pane_id);
+            Ok(json!({ "commandId": command_id, "closed": true }))
         }
         "pane.setZoomed" => {
             let pane_id = pane_id(&params)?;
@@ -1027,60 +1167,520 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 .await?;
             Ok(json!({ "paneId": pane.pane_id() }))
         }
+        "panel.ensure" => {
+            let origin_pane_id = params
+                .get("paneId")
+                .and_then(Value::as_u64)
+                .map(|id| id as PaneId)
+                .ok_or_else(|| anyhow!("paneId is required for a managed panel"))?;
+            let cwd = params.get("cwd").and_then(Value::as_str);
+            let (pane, reused, pool_size) = ensure_managed_pane(origin_pane_id, cwd).await?;
+            let (window_id, tab_id) = mux
+                .resolve_pane_id(pane.pane_id())
+                .map(|(_, window, tab)| (window, tab))
+                .ok_or_else(|| anyhow!("managed pane is not attached to a tab"))?;
+            Ok(json!({
+                "paneId": pane.pane_id(),
+                "originPaneId": origin_pane_id,
+                "windowId": window_id,
+                "tabId": tab_id,
+                "poolSize": pool_size,
+                "reused": reused,
+                "limit": MAX_MANAGED_PANES,
+            }))
+        }
         "command.run" => {
-            let command = command_builder(params.get("command"))?;
+            let command = params
+                .get("command")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("command must be an array of strings"))?;
+            anyhow::ensure!(!command.is_empty(), "command must not be empty");
             let cwd = params
                 .get("cwd")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let origin = params
+            let origin_pane_id = params
                 .get("paneId")
                 .and_then(Value::as_u64)
-                .map(|id| id as PaneId);
-            let requested_workspace = params.get("workspace").and_then(Value::as_str);
-            let origin_window_id =
-                origin.and_then(|pane| mux.resolve_pane_id(pane).map(|(_, window, _)| window));
-            // An explicit workspace is an orchestration boundary: keep using
-            // the origin window for same-workspace runs, but create a new mux
-            // window when the requested workspace differs. Without this,
-            // `terminal_run({workspace = ...})` silently opened another tab in
-            // the current workspace and agents could not arrange workspaces.
-            let window_id = match (origin_window_id, requested_workspace) {
-                (Some(window_id), Some(workspace))
-                    if mux
-                        .get_window(window_id)
-                        .is_some_and(|window| window.get_workspace() == workspace) =>
-                {
-                    Some(window_id)
-                }
-                (Some(window_id), None) => Some(window_id),
-                (None, None) => mux.iter_windows().into_iter().next(),
-                _ => None,
+                .map(|id| id as PaneId)
+                .ok_or_else(|| anyhow!("paneId is required for a managed command"))?;
+
+            let (pane, reused, pool_size) =
+                ensure_managed_pane(origin_pane_id, cwd.as_deref()).await?;
+
+            let sequence = REVISION.fetch_add(1, Ordering::Relaxed);
+            let command_id = format!("command-{sequence}");
+            let script = managed_command_script(command, cwd.as_deref())?;
+            let record = ManagedCommand {
+                pane_id: pane.pane_id(),
+                owner_client_id: params
+                    .get("ownerClientId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                running: true,
+                exit_code: None,
+                signal: None,
+                success: None,
+                reason: None,
             };
-            let domain = if origin.is_some() {
-                config::keyassignment::SpawnTabDomain::CurrentPaneDomain
-            } else {
-                config::keyassignment::SpawnTabDomain::DefaultDomain
-            };
-            let workspace = params
-                .get("workspace")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| mux.active_workspace());
-            let size = config::configuration().initial_size(0, None);
-            let (_tab, pane, window_id) = mux
-                .spawn_tab_or_window(
-                    window_id, domain, command, cwd, size, origin, workspace, None,
-                )
-                .await?;
+            MANAGED_COMMANDS
+                .lock()
+                .unwrap()
+                .insert(command_id.clone(), record);
+            watch_command(command_id.clone(), pane.pane_id());
+            if let Err(error) = pane.send_paste(&script) {
+                MANAGED_COMMANDS.lock().unwrap().remove(&command_id);
+                return Err(error.into());
+            }
+
+            let (window_id, tab_id) = mux
+                .resolve_pane_id(pane.pane_id())
+                .map(|(_, window, tab)| (window, tab))
+                .ok_or_else(|| anyhow!("managed pane is not attached to a tab"))?;
             Ok(json!({
-                "commandId": format!("command-{}", pane.pane_id()),
+                "commandId": command_id,
                 "paneId": pane.pane_id(),
-                "windowId": window_id
+                "originPaneId": origin_pane_id,
+                "windowId": window_id,
+                "tabId": tab_id,
+                "poolSize": pool_size,
+                "reused": reused,
+                "persistent": true,
+                "completion": "automation.event command.finished"
             }))
         }
         _ => anyhow::bail!("unsupported mutation {method}"),
     }
+}
+
+async fn ensure_managed_pane(
+    origin_pane_id: PaneId,
+    cwd: Option<&str>,
+) -> anyhow::Result<(Arc<dyn mux::pane::Pane>, bool, usize)> {
+    let mux = Mux::get();
+    let (_, origin_window_id, origin_tab_id) = mux
+        .resolve_pane_id(origin_pane_id)
+        .ok_or_else(|| anyhow!("origin pane {origin_pane_id} not found"))?;
+    let mut pools = MANAGED_PANES.lock().unwrap();
+    let pool = pools.entry(origin_pane_id).or_default();
+    // A managed pane may only be reused or extended while it remains in the
+    // origin pane's tab. Moving it elsewhere removes it from this pool but
+    // never closes the user's pane.
+    pool.retain(|pane_id| {
+        mux.get_pane(*pane_id).is_some()
+            && mux
+                .resolve_pane_id(*pane_id)
+                .is_some_and(|(_, window_id, tab_id)| {
+                    window_id == origin_window_id && tab_id == origin_tab_id
+                })
+    });
+
+    let reusable = pool.iter().copied().find(|pane_id| {
+        mux.get_pane(*pane_id)
+            .map(|pane| !pane.is_dead() && !pane_is_busy(*pane_id))
+            .unwrap_or(false)
+    });
+    if let Some(pane_id) = reusable {
+        let pane = mux
+            .get_pane(pane_id)
+            .ok_or_else(|| anyhow!("managed pane {pane_id} disappeared"))?;
+        return Ok((pane, true, pool.len()));
+    }
+
+    anyhow::ensure!(
+        pool.len() < MAX_MANAGED_PANES,
+        "all {MAX_MANAGED_PANES} managed terminal panes are busy; cancel one or wait for completion"
+    );
+    let source_pane = pool.last().copied().unwrap_or(origin_pane_id);
+    let first_pane = pool.is_empty();
+    let shell_setup = prepare_managed_shell()?;
+    let ManagedShellSetup {
+        command: shell_command,
+        callback_fifo,
+        cleanup_dir,
+    } = shell_setup;
+    let request = SplitRequest {
+        // First split: a right-hand side panel. Further splits stack panes
+        // vertically inside that side panel.
+        direction: if first_pane {
+            SplitDirection::Horizontal
+        } else {
+            SplitDirection::Vertical
+        },
+        target_is_second: true,
+        top_level: false,
+        size: SplitSize::Percent(50),
+    };
+    let (pane, _size) = mux
+        .split_pane(
+            source_pane,
+            request,
+            SplitSource::Spawn {
+                command: Some(shell_command),
+                command_dir: cwd.map(str::to_string),
+            },
+            config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+        )
+        .await?;
+    let pane_id = pane.pane_id();
+    start_shell_callback(pane_id, callback_fifo, cleanup_dir);
+    pool.push(pane_id);
+    if pool.len() == MAX_MANAGED_PANES {
+        balance_managed_panel(origin_tab_id, &pool);
+    }
+    Ok((pane, false, pool.len()))
+}
+
+fn balance_managed_panel(tab_id: TabId, pane_ids: &[PaneId]) {
+    if pane_ids.len() != MAX_MANAGED_PANES {
+        return;
+    }
+    let Some(tab) = Mux::get().get_tab(tab_id) else {
+        return;
+    };
+    let managed = tab
+        .iter_panes()
+        .into_iter()
+        .filter(|pane| pane_ids.contains(&pane.pane.pane_id()))
+        .collect::<Vec<_>>();
+    if managed.len() != MAX_MANAGED_PANES {
+        return;
+    }
+    let Some(panel_top) = managed.iter().map(|pane| pane.top).min() else {
+        return;
+    };
+    let Some(panel_bottom) = managed.iter().map(|pane| pane.top + pane.height).max() else {
+        return;
+    };
+    let panel_height = panel_bottom.saturating_sub(panel_top);
+    if panel_height < MAX_MANAGED_PANES {
+        return;
+    }
+    let Some(outer) = tab
+        .iter_splits()
+        .into_iter()
+        .filter(|split| split.direction == SplitDirection::Vertical)
+        .min_by_key(|split| split.top)
+    else {
+        return;
+    };
+    let desired = panel_top + panel_height / MAX_MANAGED_PANES;
+    let delta = desired as isize - outer.top as isize;
+    if delta != 0 {
+        tab.resize_split_by(outer.index, delta);
+    }
+}
+
+fn broadcast_event_to(target_client_id: Option<&str>, event: &str, data: Value) {
+    let revision = REVISION.fetch_add(1, Ordering::Relaxed) + 1;
+    let notification = EventNotification {
+        jsonrpc: "2.0",
+        method: "automation.event",
+        params: json!({ "event": event, "revision": revision, "data": data }),
+    };
+    let Ok(line) = serde_json::to_string(&notification) else {
+        return;
+    };
+
+    let clients = CLIENTS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(client_id, _)| target_client_id.is_none_or(|target| target == client_id.as_str()))
+        .map(|(client_id, sender)| (client_id.clone(), sender.clone()))
+        .collect::<Vec<_>>();
+    let mut stale = Vec::new();
+    for (client_id, sender) in clients {
+        if sender.try_send(line.clone()).is_err() {
+            stale.push(client_id);
+        }
+    }
+    if !stale.is_empty() {
+        let mut clients = CLIENTS.lock().unwrap();
+        for client_id in stale {
+            clients.remove(&client_id);
+        }
+    }
+}
+
+fn pane_is_busy(pane_id: PaneId) -> bool {
+    MANAGED_COMMANDS
+        .lock()
+        .unwrap()
+        .values()
+        .any(|command| command.pane_id == pane_id && command.running)
+}
+
+fn shell_quote(value: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(!value.contains('\0'), "command contains a NUL byte");
+    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+}
+
+fn managed_command_script(command: &[Value], cwd: Option<&str>) -> anyhow::Result<String> {
+    let mut words = Vec::with_capacity(command.len());
+    for value in command {
+        let value = value
+            .as_str()
+            .ok_or_else(|| anyhow!("command arguments must be strings"))?;
+        words.push(shell_quote(value)?);
+    }
+    let mut script = String::new();
+    if let Some(cwd) = cwd {
+        script.push_str("cd -- ");
+        script.push_str(&shell_quote(cwd)?);
+        script.push_str(" && ");
+    }
+    script.push_str(&words.join(" "));
+    script.push('\n');
+    Ok(script)
+}
+
+fn fifo_path_literal(path: &Path) -> anyhow::Result<String> {
+    shell_quote(
+        path.to_str()
+            .ok_or_else(|| anyhow!("callback FIFO path is not valid UTF-8"))?,
+    )
+}
+
+fn default_shell_path() -> String {
+    #[cfg(unix)]
+    unsafe {
+        let passwd = libc::getpwuid(libc::getuid());
+        if !passwd.is_null() && !(*passwd).pw_shell.is_null() {
+            if let Ok(shell) = CStr::from_ptr((*passwd).pw_shell).to_str() {
+                if !shell.is_empty() {
+                    return shell.to_string();
+                }
+            }
+        }
+    }
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+}
+
+fn make_callback_fifo(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let raw = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| anyhow!("callback FIFO path contains NUL"))?;
+        if unsafe { libc::mkfifo(raw.as_ptr(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("create callback FIFO {}", path.display()));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        anyhow::bail!("shell callback FIFOs are only supported on Unix")
+    }
+}
+
+fn prepare_managed_shell() -> anyhow::Result<ManagedShellSetup> {
+    let sequence = SHELL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let cleanup_dir = std::env::temp_dir().join(format!(
+        "wezterm-automation-shell-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&cleanup_dir)
+        .with_context(|| format!("create managed shell directory {}", cleanup_dir.display()))?;
+    let callback_fifo = cleanup_dir.join("callback.fifo");
+    if let Err(error) = make_callback_fifo(&callback_fifo) {
+        let _ = fs::remove_dir_all(&cleanup_dir);
+        return Err(error);
+    }
+
+    let configured = config::configuration().default_prog.clone();
+    let argv = configured.unwrap_or_else(|| vec![default_shell_path()]);
+    anyhow::ensure!(!argv.is_empty(), "managed shell command is empty");
+    let name = Path::new(&argv[0])
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sh")
+        .to_ascii_lowercase();
+    let fifo = fifo_path_literal(&callback_fifo)?;
+    let rc_path = cleanup_dir.join("rc");
+    let mut command = CommandBuilder::from_argv(argv.into_iter().map(OsString::from).collect());
+
+    if name == "zsh" {
+        // The user's normal zsh startup files install the callback hook.
+        command.env("PI_WEZTERM_CALLBACK_FIFO", &callback_fifo);
+    } else if name == "bash" {
+        let rc = format!(
+            "if [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n\
+__pi_wezterm_prompt() {{\n\
+  local __pi_status=$?\n\
+  printf '%s\\n' \"$__pi_status\" > {fifo}\n\
+  return $__pi_status\n\
+}}\n\
+if declare -p PROMPT_COMMAND >/dev/null 2>&1 && declare -p PROMPT_COMMAND | grep -q 'declare -a'; then\n\
+  PROMPT_COMMAND=(__pi_wezterm_prompt \"${{PROMPT_COMMAND[@]}}\")\n\
+else\n\
+  PROMPT_COMMAND=__pi_wezterm_prompt${{PROMPT_COMMAND:+;${{PROMPT_COMMAND}}}}\n\
+fi\n",
+        );
+        fs::write(&rc_path, rc)?;
+        command.arg("--rcfile");
+        command.arg(&rc_path);
+        command.arg("-i");
+    } else {
+        let rc = format!(
+            "__pi_wezterm_prompt() {{\n\
+  __pi_status=$?\n\
+  printf '%s\\n' \"$__pi_status\" > {fifo}\n\
+  return $__pi_status\n\
+}}\n\n__pi_wezterm_prompt\n",
+        );
+        fs::write(&rc_path, rc)?;
+        command.env("ENV", &rc_path);
+    }
+
+    Ok(ManagedShellSetup {
+        command,
+        callback_fifo,
+        cleanup_dir,
+    })
+}
+
+fn start_shell_callback(pane_id: PaneId, callback_fifo: PathBuf, cleanup_dir: PathBuf) {
+    #[cfg(unix)]
+    let (reader, writer) = match open_callback_fifo(&callback_fifo) {
+        Ok(handles) => handles,
+        Err(error) => {
+            log::debug!("managed shell callback {} ended: {error}", pane_id);
+            let _ = fs::remove_dir_all(&cleanup_dir);
+            return;
+        }
+    };
+    #[cfg(not(unix))]
+    let _ = (pane_id, callback_fifo, cleanup_dir);
+
+    thread::Builder::new()
+        .name(format!("wezterm-shell-callback-{pane_id}"))
+        .spawn(move || {
+            #[cfg(unix)]
+            {
+                // Keep the writer open while the blocking reader is alive;
+                // shell prompt writes remain the only completion notifications.
+                let _writer = writer;
+                for line in BufReader::new(reader).lines() {
+                    let Ok(line) = line else { break };
+                    if let Ok(exit_code) = line.trim().parse::<i32>() {
+                        finish_running_command(pane_id, exit_code);
+                    }
+                }
+            }
+            let _ = fs::remove_dir_all(&cleanup_dir);
+        })
+        .ok();
+}
+
+#[cfg(unix)]
+fn open_callback_fifo(path: &Path) -> anyhow::Result<(std::fs::File, std::fs::File)> {
+    let reader = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let writer = OpenOptions::new().write(true).open(path)?;
+    let fd: RawFd = reader.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    anyhow::ensure!(flags >= 0, "get callback FIFO flags failed");
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    anyhow::ensure!(result == 0, "set callback FIFO blocking mode failed");
+    Ok((reader, writer))
+}
+
+fn finish_running_command(pane_id: PaneId, exit_code: i32) {
+    let command_id = MANAGED_COMMANDS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, command)| command.pane_id == pane_id && command.running)
+        .map(|(command_id, _)| command_id.clone());
+    if let Some(command_id) = command_id {
+        finish_command(
+            &command_id,
+            Some(exit_code),
+            None,
+            Some(exit_code == 0),
+            None,
+        );
+    }
+}
+
+fn finish_command(
+    command_id: &str,
+    exit_code: Option<i32>,
+    signal: Option<String>,
+    success: Option<bool>,
+    reason: Option<&str>,
+) {
+    let (event, owner_client_id) = {
+        let mut commands = MANAGED_COMMANDS.lock().unwrap();
+        let Some(command) = commands.get_mut(command_id) else {
+            return;
+        };
+        if !command.running {
+            return;
+        }
+        command.running = false;
+        command.exit_code = exit_code;
+        command.signal = signal;
+        command.success = success;
+        command.reason = reason.map(str::to_string);
+        let output = pane_text(command.pane_id, None, None)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        (
+            json!({
+                "commandId": command_id,
+                "exitCode": command.exit_code,
+                "signal": command.signal,
+                "success": command.success,
+                "reason": command.reason,
+                "output": output,
+            }),
+            command.owner_client_id.clone(),
+        )
+    };
+    broadcast_event_to(owner_client_id.as_deref(), "command.finished", event);
+}
+
+fn watch_command(command_id: String, pane_id: PaneId) {
+    // Shell prompt hooks deliver normal command completion through a side
+    // channel. Mux lifecycle notifications only cover shell/pane teardown.
+    Mux::get().subscribe(move |notification| {
+        if !MANAGED_COMMANDS
+            .lock()
+            .unwrap()
+            .get(&command_id)
+            .is_some_and(|command| command.running)
+        {
+            return false;
+        }
+        match notification {
+            MuxNotification::PaneExited(exited_pane_id, status) if exited_pane_id == pane_id => {
+                finish_command(
+                    &command_id,
+                    Some(status.exit_code() as i32),
+                    status.signal().map(str::to_string),
+                    Some(status.success()),
+                    Some("shell-exited"),
+                );
+                false
+            }
+            MuxNotification::PaneRemoved(removed_pane_id) if removed_pane_id == pane_id => {
+                finish_command(&command_id, None, None, Some(false), Some("pane-removed"));
+                false
+            }
+            _ => true,
+        }
+    });
 }
 
 fn command_builder(value: Option<&Value>) -> anyhow::Result<Option<CommandBuilder>> {
@@ -1121,5 +1721,15 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["method"], "automation.event");
         assert_eq!(value["params"]["data"]["paneId"], 7);
+    }
+
+    #[test]
+    fn managed_scripts_quote_arguments_without_terminal_completion_output() {
+        let command = vec![json!("printf"), json!("it's safe")];
+        let script = managed_command_script(&command, Some("/tmp/work")).unwrap();
+        assert!(script.contains("cd -- '/tmp/work'"));
+        assert!(script.contains("'it'\\''s safe'"));
+        assert!(!script.contains("PI_WEZTERM_DONE"));
+        assert_eq!(script.lines().count(), 1);
     }
 }

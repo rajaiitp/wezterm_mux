@@ -112,6 +112,7 @@ impl GuiFrontEnd {
                 MuxNotification::PaneRemoved(_) => {}
                 MuxNotification::WindowInvalidated(_) => {}
                 MuxNotification::PaneOutput(_) => {}
+                MuxNotification::PaneExited(_, _) => {}
                 MuxNotification::PaneAdded(_) => {}
                 MuxNotification::Alert {
                     pane_id,

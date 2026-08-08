@@ -21,13 +21,6 @@ type Pending = {
   timer: NodeJS.Timeout;
 };
 
-export type ClientCall = {
-  callbackId: string;
-  method: string;
-  params: Json;
-  sourceClientId?: string;
-};
-
 export type AutomationEvent = {
   event: string;
   revision: number;
@@ -40,7 +33,6 @@ export type AutomationClientOptions = {
   clientName?: string;
   clientVersion?: string;
   onEvent?: (event: AutomationEvent) => void;
-  onClientCall?: (call: ClientCall) => Promise<Json>;
   onConnectionChange?: (connected: boolean, reason?: string) => void;
 };
 
@@ -86,17 +78,14 @@ export class AutomationClient {
               pid: process.pid,
             },
             origin: this.options.paneId === undefined ? undefined : { paneId: this.options.paneId },
-            requestedCapabilities: ["*"],
-            callbacks: [
-              "agent.getState",
-              "agent.prompt",
-              "agent.steer",
-              "agent.followUp",
-              "agent.abort",
-              "agent.compact",
-              "agent.newSession",
-              "agent.setModel",
-              "agent.setThinkingLevel",
+            requestedCapabilities: [
+              "pane.read",
+              "pane.input.text",
+              "pane.create",
+              "pane.layout",
+              "panel.manage",
+              "command.run",
+              "command.cancel",
             ],
           });
           this.options.onConnectionChange?.(true);
@@ -150,10 +139,6 @@ export class AutomationClient {
     });
   }
 
-  async subscribe(): Promise<void> {
-    await this.request("topology.subscribe", { initialSnapshot: false });
-  }
-
   disconnect(): void {
     this.closed = true;
     this.socket?.end();
@@ -181,10 +166,6 @@ export class AutomationClient {
         this.options.onEvent?.(message.params as AutomationEvent);
         continue;
       }
-      if ("method" in message && message.method === "client.call") {
-        void this.handleClientCall(message.params as ClientCall);
-        continue;
-      }
       if (!("id" in message) || message.id === undefined) continue;
       const id = String(message.id);
       const pending = this.pending.get(id);
@@ -197,21 +178,6 @@ export class AutomationClient {
         pending.resolve(message.result ?? null);
       }
     }
-  }
-
-  private async handleClientCall(call: ClientCall): Promise<void> {
-    let result: Json = null;
-    try {
-      result = this.options.onClientCall ? await this.options.onClientCall(call) : null;
-    } catch (error) {
-      result = { error: error instanceof Error ? error.message : String(error) };
-    }
-    if (!this.socket || this.closed) return;
-    this.socket.write(`${JSON.stringify({
-      jsonrpc: "2.0",
-      method: "client.callback_result",
-      params: { callbackId: call.callbackId, result },
-    })}\n`);
   }
 
   private failPending(error: Error): void {
