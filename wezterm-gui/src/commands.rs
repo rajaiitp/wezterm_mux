@@ -2004,6 +2004,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
                 },
             }
         }
+        CallAutomationClient(call) => CommandDef {
+            brief: format!("Call automation client: {}", call.method).into(),
+            doc: "Invoke a typed callback on an attached automation client".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &[],
+            icon: Some("md_robot"),
+        },
         ResetTerminal => CommandDef {
             brief: "Reset the terminal emulation state in the current pane".into(),
             doc: "Reset the terminal emulation state in the current pane".into(),

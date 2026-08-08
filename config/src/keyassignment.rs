@@ -505,6 +505,11 @@ pub struct InputSelector {
 
     #[dynamic(default = "default_fuzzy_description")]
     pub fuzzy_description: String,
+
+    /// Optional callback invoked by the native selector when Ctrl+D is pressed
+    /// with an entry selected.
+    #[dynamic(default)]
+    pub delete_action: Option<Box<KeyAssignment>>,
 }
 
 fn default_num_alphabet() -> String {
@@ -531,6 +536,17 @@ pub struct Confirmation {
 
 fn default_message() -> String {
     "🛑 Really continue?".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct AutomationClientCall {
+    /// Client ID, or `origin-pane` to target the Pi client attached to the
+    /// active pane.
+    #[dynamic(default)]
+    pub client_id: Option<String>,
+    pub method: String,
+    #[dynamic(default)]
+    pub params: String,
 }
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
@@ -605,6 +621,7 @@ pub enum KeyAssignment {
         confirm: bool,
     },
     EmitEvent(String),
+    CallAutomationClient(AutomationClientCall),
     QuickSelect,
     QuickSelectArgs(QuickSelectArguments),
 

@@ -7,6 +7,7 @@ mod activate_pane;
 mod activate_pane_direction;
 mod activate_tab;
 mod adjust_pane_size;
+mod automation;
 mod get_pane_direction;
 mod get_text;
 mod kill_pane;
@@ -96,6 +97,10 @@ enum CliSubCommand {
 
     #[command(name = "proxy", about = "start rpc proxy pipe")]
     Proxy(proxy::ProxyCommand),
+
+    /// Call a registered native automation client callback.
+    #[command(name = "automation-call", rename_all = "kebab")]
+    AutomationCall(automation::AutomationCall),
 
     #[command(name = "tlscreds", about = "obtain tls credentials")]
     TlsCreds(tls_creds::TlsCredsCommand),
@@ -225,6 +230,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::GetText(cmd) => cmd.run(client).await,
         CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &config).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &config).await,
+        CliSubCommand::AutomationCall(cmd) => cmd.run().await,
         CliSubCommand::TlsCreds(cmd) => cmd.run(client).await,
         CliSubCommand::ActivatePaneDirection(cmd) => cmd.run(client).await,
         CliSubCommand::GetPaneDirection(cmd) => cmd.run(client).await,

@@ -394,12 +394,23 @@ mod ossl;
 
 pub fn spawn_listener() -> anyhow::Result<()> {
     let config = configuration();
+    let mut automation_socket_set = false;
     for unix_dom in &config.unix_domains {
         std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
         let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
         thread::spawn(move || {
             listener.run();
         });
+
+        // The first configured domain is the persistent/default domain in this
+        // fork. Export its native automation endpoint to all panes spawned by
+        // this server. Additional mux domains still receive their own
+        // endpoint when they are used as standalone servers.
+        if !automation_socket_set {
+            let automation = wezterm_mux_server_impl::automation::spawn_listener(unix_dom)?;
+            std::env::set_var("WEZTERM_AUTOMATION_SOCKET", automation);
+            automation_socket_set = true;
+        }
     }
 
     for tls_server in &config.tls_servers {

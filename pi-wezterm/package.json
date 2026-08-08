@@ -1,0 +1,13 @@
+{
+  "name": "pi-wezterm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Native callback-driven Pi client for the WezTerm Automation API",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "dependencies": {
+    "typebox": "^1.1.38"
+  }
+}

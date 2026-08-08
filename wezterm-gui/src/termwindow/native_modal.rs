@@ -173,6 +173,7 @@ pub struct NativeInputSelector {
     element: RefCell<Option<Vec<ComputedElement>>>,
     args: InputSelector,
     event_name: String,
+    delete_event_name: Option<String>,
     window: GuiWin,
     pane: MuxPane,
     view: RefCell<SelectorView>,
@@ -186,6 +187,13 @@ impl NativeInputSelector {
                 "InputSelector requires action to be defined by wezterm.action_callback"
             ),
         };
+        let delete_event_name = match args.delete_action.as_deref() {
+            Some(KeyAssignment::EmitEvent(name)) => Some(name.clone()),
+            Some(_) => {
+                anyhow::bail!("InputSelector delete_action requires wezterm.action_callback")
+            }
+            None => None,
+        };
         let pane = term_window
             .get_active_pane_no_overlay()
             .ok_or_else(|| anyhow::anyhow!("no active pane for InputSelector"))?;
@@ -195,6 +203,7 @@ impl NativeInputSelector {
             element: RefCell::new(None),
             args,
             event_name,
+            delete_event_name,
             window: GuiWin::new(term_window),
             pane: MuxPane(pane.pane_id()),
             view: RefCell::new(view),
@@ -224,13 +233,37 @@ impl NativeInputSelector {
     }
 
     fn finish(&self, term_window: &mut TermWindow, entry: Option<InputSelectorEntry>) {
+        self.finish_with_event(term_window, self.event_name.clone(), entry);
+    }
+
+    fn finish_with_event(
+        &self,
+        term_window: &mut TermWindow,
+        event_name: String,
+        entry: Option<InputSelectorEntry>,
+    ) {
         term_window.cancel_modal();
         crate::overlay::selector::trampoline(
-            self.event_name.clone(),
+            event_name,
             self.window.clone(),
             self.pane.clone(),
             entry,
         );
+    }
+
+    fn delete_selected(&self, term_window: &mut TermWindow) -> bool {
+        let Some(event_name) = self.delete_event_name.clone() else {
+            return false;
+        };
+        let entry = {
+            let view = self.view.borrow();
+            view.filtered.get(view.selected).cloned()
+        };
+        let Some(entry) = entry else {
+            return true;
+        };
+        self.finish_with_event(term_window, event_name, Some(entry));
+        true
     }
 
     fn invalidate(&self, term_window: &mut TermWindow) {
@@ -284,6 +317,11 @@ impl Modal for NativeInputSelector {
                 };
                 self.finish(term_window, entry);
                 return Ok(true);
+            }
+            (KeyCode::Char('d'), KeyModifiers::CTRL) => {
+                if self.delete_selected(term_window) {
+                    return Ok(true);
+                }
             }
             (KeyCode::UpArrow, KeyModifiers::NONE)
             | (KeyCode::Char('p'), KeyModifiers::CTRL)
@@ -345,8 +383,14 @@ impl Modal for NativeInputSelector {
                 .map(|entry| entry.label.chars().count())
                 .max()
                 .unwrap_or(20);
+            let footer = if self.delete_event_name.is_some() {
+                "↑↓ move   Enter select   Ctrl+D delete   Esc close"
+            } else {
+                "↑↓ move   Enter select   Esc close"
+            };
             let width = label_width
                 .max(self.args.title.chars().count() + 4)
+                .max(footer.chars().count())
                 .clamp(40, 96)
                 + 4;
             let mut rows = vec![text_row(
@@ -396,12 +440,7 @@ impl Modal for NativeInputSelector {
                 }
             }
             rows.push(text_row(&font, "", bg.clone(), fg.clone()));
-            rows.push(text_row(
-                &font,
-                "↑↓ move   Enter select   Esc close",
-                bg.clone(),
-                fg.clone(),
-            ));
+            rows.push(text_row(&font, footer, bg.clone(), fg.clone()));
             // Size to the rows we actually render: the two blank rows are
             // intentional separators rather than unused space at the bottom.
             let height = rows.len().clamp(5, max_rows + 5);

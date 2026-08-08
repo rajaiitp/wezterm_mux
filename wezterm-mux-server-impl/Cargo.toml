@@ -24,6 +24,8 @@ portable-pty = { workspace=true, features = ["serde_support"]}
 promise.workspace = true
 rangeset.workspace = true
 rcgen.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 smol.workspace = true
 termwiz = { workspace=true, features=["use_serde"] }
 url.workspace = true

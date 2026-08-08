@@ -479,6 +479,9 @@ impl LocalDomain {
         if let Ok(sock) = std::env::var("WEZTERM_UNIX_SOCKET") {
             cmd.env("WEZTERM_UNIX_SOCKET", sock);
         }
+        if let Ok(sock) = std::env::var("WEZTERM_AUTOMATION_SOCKET") {
+            cmd.env("WEZTERM_AUTOMATION_SOCKET", sock);
+        }
         cmd.env("WEZTERM_PANE", pane_id.to_string());
         if let Some(agent) = Mux::get().agent.as_ref() {
             cmd.env("SSH_AUTH_SOCK", agent.path());

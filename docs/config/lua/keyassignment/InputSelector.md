@@ -45,6 +45,12 @@ These additional fields are also available:
 * `fuzzy_description` - a string to display when in fuzzy finding mode. Defaults to:
   `"Fuzzy matching: "`.
 
+{{since('20260808-105418-affe312c')}}
+
+* `delete_action` - an optional callback invoked by the native selector when
+  <kbd>Ctrl</kbd> + <kbd>D</kbd> is pressed. It receives the selected `id` and
+  `label`, just like `action`.
+
 
 ### Key Assignments
 
@@ -67,6 +73,7 @@ The default key assignments in the InputSelector are as follows:
 |                | <kbd>Ctrl</kbd> + <kbd>P</kbd> |
 |                | <kbd>Ctrl</kbd> + <kbd>K</kbd> {{since('20240127-113634-bbcac864', inline=True)}} |
 |                | <kbd>k</kbd>  (if not in `alphabet`)   |
+| Delete selected entry (when `delete_action` is configured) | <kbd>Ctrl</kbd> + <kbd>D</kbd> |
 | Quit     | <kbd>Ctrl</kbd> + <kbd>G</kbd> |
 |          | <kbd>Ctrl</kbd> + <kbd>C</kbd> {{since('20240127-113634-bbcac864', inline=True)}} |
 |          | <kbd>Escape</kbd> |

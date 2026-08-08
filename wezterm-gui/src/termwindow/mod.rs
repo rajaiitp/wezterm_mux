@@ -30,8 +30,8 @@ use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
 use anyhow::{anyhow, ensure, Context};
 use config::keyassignment::{
-    Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, Pattern, PromptInputLine,
-    QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
+    AutomationClientCall, Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, Pattern,
+    PromptInputLine, QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
 };
 use config::window::WindowLevel;
 use config::{
@@ -2603,6 +2603,96 @@ impl TermWindow {
         self.move_tab(tab)
     }
 
+    #[cfg(unix)]
+    fn call_automation_client(
+        &self,
+        pane: &Arc<dyn Pane>,
+        call: &AutomationClientCall,
+    ) -> anyhow::Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        use std::path::PathBuf;
+
+        let socket_path = std::env::var_os("WEZTERM_AUTOMATION_SOCKET")
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.config.unix_domains.first().map(|domain| {
+                    let mux_socket = domain.socket_path();
+                    let name = mux_socket
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("wezterm-mux.sock");
+                    mux_socket.with_file_name(format!("{name}.automation"))
+                })
+            })
+            .ok_or_else(|| anyhow!("no automation socket is configured"))?;
+        let target = call
+            .client_id
+            .clone()
+            .unwrap_or_else(|| "origin-pane".to_string());
+        let method = call.method.clone();
+        let params: serde_json::Value = serde_json::from_str(&call.params)
+            .with_context(|| "automation callback params must be valid JSON")?;
+        let pane_id = pane.pane_id();
+
+        std::thread::Builder::new()
+            .name("wezterm-automation-callback".to_string())
+            .spawn(move || {
+                let result = (|| -> anyhow::Result<()> {
+                    let stream = UnixStream::connect(&socket_path)?;
+                    let mut writer = stream.try_clone()?;
+                    let mut reader = BufReader::new(stream);
+                    let hello = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "automation.hello",
+                        "params": {
+                            "protocolVersion": 1,
+                            "client": { "name": "wezterm-gui", "version": config::wezterm_version() },
+                            "requestedCapabilities": ["client.callback"]
+                        }
+                    });
+                    writeln!(writer, "{}", serde_json::to_string(&hello)?)?;
+                    writer.flush()?;
+                    let mut line = String::new();
+                    reader.read_line(&mut line)?;
+                    let request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "client.call",
+                        "params": {
+                            "targetClientId": target,
+                            "originPaneId": pane_id,
+                            "method": method,
+                            "params": params
+                        }
+                    });
+                    writeln!(writer, "{}", serde_json::to_string(&request)?)?;
+                    writer.flush()?;
+                    line.clear();
+                    reader.read_line(&mut line)?;
+                    let response: serde_json::Value = serde_json::from_str(line.trim_end())?;
+                    if let Some(error) = response.get("error") {
+                        anyhow::bail!("automation callback failed: {error}");
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = result {
+                    log::warn!("automation callback failed: {err:#}");
+                }
+            })?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn call_automation_client(
+        &self,
+        _pane: &Arc<dyn Pane>,
+        _call: &AutomationClientCall,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("automation callbacks are not implemented on this platform")
+    }
+
     pub fn perform_key_assignment(
         &mut self,
         pane: &Arc<dyn Pane>,
@@ -2860,6 +2950,9 @@ impl TermWindow {
             }
             EmitEvent(name) => {
                 self.emit_window_event(name, None);
+            }
+            CallAutomationClient(call) => {
+                self.call_automation_client(pane, call)?;
             }
             CompleteSelectionOrOpenLinkAtMouseCursor(dest) => {
                 let text = self.selection_text(pane);
