@@ -349,8 +349,6 @@ impl Modal for NativeInputSelector {
                 .max(self.args.title.chars().count() + 4)
                 .clamp(40, 96)
                 + 4;
-            let height = (visible.len() + 5).clamp(7, max_rows + 5);
-
             let mut rows = vec![text_row(
                 &font,
                 if self.args.title.is_empty() {
@@ -361,17 +359,20 @@ impl Modal for NativeInputSelector {
                 bg.clone(),
                 fg.clone(),
             )];
+            rows.push(text_row(&font, "", bg.clone(), fg.clone()));
             let query = if view.filter.is_empty() {
                 self.args.fuzzy_description.clone()
             } else {
                 format!("{}{}█", self.args.fuzzy_description, view.filter)
             };
-            rows.push(text_row(
-                &font,
-                query,
-                selected_bg.clone(),
-                selected_fg.clone(),
-            ));
+            if !query.is_empty() {
+                rows.push(text_row(
+                    &font,
+                    query,
+                    selected_bg.clone(),
+                    selected_fg.clone(),
+                ));
+            }
 
             if visible.is_empty() {
                 rows.push(text_row(&font, "  no matches", bg.clone(), fg.clone()));
@@ -394,12 +395,16 @@ impl Modal for NativeInputSelector {
                     ));
                 }
             }
+            rows.push(text_row(&font, "", bg.clone(), fg.clone()));
             rows.push(text_row(
                 &font,
-                "↑↓ select  ·  Enter accept  ·  Esc cancel",
+                "↑↓ move   Enter select   Esc close",
                 bg.clone(),
                 fg.clone(),
             ));
+            // Size to the rows we actually render: the two blank rows are
+            // intentional separators rather than unused space at the bottom.
+            let height = rows.len().clamp(5, max_rows + 5);
             drop(view);
             self.element.borrow_mut().replace(compute_centered_panel(
                 term_window,
@@ -570,9 +575,10 @@ impl Modal for NativePromptInput {
                 text_row(&font, description, bg.clone(), fg.clone()),
                 text_row(&font, "", bg.clone(), fg.clone()),
                 text_row(&font, input, input_bg, input_fg),
+                text_row(&font, "", bg.clone(), fg.clone()),
                 text_row(
                     &font,
-                    "Enter save  ·  Esc cancel  ·  Ctrl+U clear",
+                    "Enter save   Esc close   Ctrl+U clear",
                     bg.clone(),
                     fg.clone(),
                 ),
@@ -580,7 +586,7 @@ impl Modal for NativePromptInput {
             drop(view);
             self.element
                 .borrow_mut()
-                .replace(compute_centered_panel(term_window, rows, width, 7)?);
+                .replace(compute_centered_panel(term_window, rows, width, 5)?);
         }
         Ok(Ref::map(self.element.borrow(), |value| {
             value.as_ref().unwrap().as_slice()
@@ -701,7 +707,10 @@ impl Modal for NativeConfirmation {
             let (selected_bg, selected_fg) = selection_colors(term_window);
             let width = self.args.message.chars().count().clamp(40, 72) + 4;
             let wrapped = textwrap::wrap(&self.args.message, width.saturating_sub(4));
-            let mut rows = vec![text_row(&font, "confirm", bg.clone(), fg.clone())];
+            let mut rows = vec![
+                text_row(&font, "Confirm", bg.clone(), fg.clone()),
+                text_row(&font, "", bg.clone(), fg.clone()),
+            ];
             for line in &wrapped {
                 rows.push(text_row(&font, line.to_string(), bg.clone(), fg.clone()));
             }
@@ -743,9 +752,10 @@ impl Modal for NativeConfirmation {
                     .colors(element_colors(bg.clone(), fg.clone()))
                     .display(DisplayType::Block),
             );
+            rows.push(text_row(&font, "", bg.clone(), fg.clone()));
             rows.push(text_row(
                 &font,
-                "←→ choose  ·  Enter confirm  ·  Esc cancel",
+                "←→ choose   Enter confirm   Esc close",
                 bg.clone(),
                 fg.clone(),
             ));

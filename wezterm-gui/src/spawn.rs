@@ -3,6 +3,7 @@ use config::keyassignment::SpawnCommand;
 use config::TermConfig;
 use mux::activity::Activity;
 use mux::domain::SplitSource;
+use mux::pane::PaneId;
 use mux::tab::SplitRequest;
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
@@ -34,6 +35,62 @@ pub fn spawn_command_impl(
         }
     })
     .detach();
+}
+
+pub async fn spawn_command_overlay_internal(
+    spawn: SpawnCommand,
+    size: TerminalSize,
+    src_window_id: MuxWindowId,
+    current_pane_id: PaneId,
+    term_config: Arc<TermConfig>,
+) -> anyhow::Result<Arc<dyn mux::pane::Pane>> {
+    let mux = Mux::get();
+    let _activity = Activity::new();
+    let domain = mux
+        .resolve_spawn_tab_domain(Some(current_pane_id), &spawn.domain)
+        .context("resolve overlay domain")?;
+
+    if domain.state() == mux::domain::DomainState::Detached {
+        domain.attach(Some(src_window_id)).await?;
+    }
+
+    let cwd = spawn
+        .cwd
+        .as_ref()
+        .map(|cwd| {
+            cwd.to_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| anyhow!("overlay cwd must be unicode: {cwd:?}"))
+        })
+        .transpose()?;
+    let command = match (
+        spawn.args.as_ref(),
+        spawn.cwd.as_ref(),
+        spawn.set_environment_variables.is_empty(),
+    ) {
+        (None, None, true) => None,
+        _ => {
+            let mut builder = spawn
+                .args
+                .as_ref()
+                .map(|args| CommandBuilder::from_argv(args.iter().map(Into::into).collect()))
+                .unwrap_or_else(CommandBuilder::new_default_prog);
+            for (key, value) in &spawn.set_environment_variables {
+                builder.env(key, value);
+            }
+            if let Some(cwd) = &spawn.cwd {
+                builder.cwd(cwd);
+            }
+            Some(builder)
+        }
+    };
+
+    let pane = domain
+        .spawn_pane(size, command, cwd)
+        .await
+        .context("spawn command overlay pane")?;
+    pane.set_config(term_config);
+    Ok(pane)
 }
 
 pub async fn spawn_command_internal(

@@ -525,7 +525,10 @@ impl super::TermWindow {
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
-                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
+                TabBarItem::RightStatus => {
+                    self.emit_window_event("workspace-status-clicked", None);
+                }
+                TabBarItem::None | TabBarItem::LeftStatus => {
                     let maximized = self
                         .window_state
                         .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
@@ -618,7 +621,11 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(if item == TabBarItem::RightStatus {
+            MouseCursor::Hand
+        } else {
+            MouseCursor::Arrow
+        }));
     }
 
     pub fn mouse_event_above_scroll_thumb(
@@ -725,7 +732,9 @@ impl super::TermWindow {
             Some(MouseCapture::TerminalPane(_))
         );
 
-        for pos in self.get_panes_to_render() {
+        // Test top-most panes first. Centered command overlays overlap their
+        // underlying pane and are appended last for painting.
+        for pos in self.get_panes_to_render().into_iter().rev() {
             if !is_already_captured
                 && row >= pos.top as i64
                 && row <= (pos.top + pos.height) as i64

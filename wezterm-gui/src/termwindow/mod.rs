@@ -220,9 +220,19 @@ pub struct SemanticZoneCache {
     zones: Vec<StableRowIndex>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayPresentation {
+    Full,
+    Centered {
+        width_percent: usize,
+        height_percent: usize,
+    },
+}
+
 pub struct OverlayState {
     pub pane: Arc<dyn Pane>,
     pub key_table_state: KeyTableState,
+    pub presentation: OverlayPresentation,
 }
 
 #[derive(Default)]
@@ -1358,9 +1368,20 @@ impl TermWindow {
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();
                 }
+                MuxNotification::PaneRemoved(pane_id) => {
+                    let overlay_tab = self.tab_state.borrow().iter().find_map(|(tab_id, state)| {
+                        state
+                            .overlay
+                            .as_ref()
+                            .filter(|overlay| overlay.pane.pane_id() == pane_id)
+                            .map(|_| *tab_id)
+                    });
+                    if let Some(tab_id) = overlay_tab {
+                        self.cancel_overlay_for_tab(tab_id, Some(pane_id));
+                    }
+                }
                 MuxNotification::PaneAdded(_)
                 | MuxNotification::WorkspaceRenamed { .. }
-                | MuxNotification::PaneRemoved(_)
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::Empty
@@ -2651,6 +2672,9 @@ impl TermWindow {
             SpawnCommandInNewWindow(spawn) => {
                 self.spawn_command(spawn, SpawnWhere::NewWindow);
             }
+            SpawnCommandInOverlay(spawn) => {
+                self.toggle_command_overlay(spawn);
+            }
             SplitHorizontal(spawn) => {
                 log::trace!("SplitHorizontal {:?}", spawn);
                 self.spawn_command(
@@ -3499,26 +3523,69 @@ impl TermWindow {
 
     fn get_pos_panes_for_tab(&self, tab: &Arc<Tab>) -> Vec<PositionedPane> {
         let tab_id = tab.tab_id();
-
-        if let Some(pane) = self
+        let overlay = self
             .tab_state(tab_id)
             .overlay
             .as_ref()
-            .map(|overlay| overlay.pane.clone())
-        {
+            .map(|overlay| (overlay.pane.clone(), overlay.presentation));
+
+        if let Some((pane, presentation)) = overlay {
             let size = tab.get_size();
-            vec![PositionedPane {
-                index: 0,
-                is_active: true,
-                is_zoomed: false,
-                left: 0,
-                top: 0,
-                width: size.cols as _,
-                height: size.rows as _,
-                pixel_width: size.cols as usize * self.render_metrics.cell_size.width as usize,
-                pixel_height: size.rows as usize * self.render_metrics.cell_size.height as usize,
-                pane,
-            }]
+            match presentation {
+                OverlayPresentation::Full => vec![PositionedPane {
+                    index: 0,
+                    is_active: true,
+                    is_zoomed: false,
+                    left: 0,
+                    top: 0,
+                    width: size.cols as _,
+                    height: size.rows as _,
+                    pixel_width: size.cols as usize * self.render_metrics.cell_size.width as usize,
+                    pixel_height: size.rows as usize
+                        * self.render_metrics.cell_size.height as usize,
+                    pane,
+                }],
+                OverlayPresentation::Centered {
+                    width_percent,
+                    height_percent,
+                } => {
+                    let width = (size.cols * width_percent / 100).max(40).min(size.cols);
+                    let height = (size.rows * height_percent / 100).max(16).min(size.rows);
+                    let left = (size.cols - width) / 2;
+                    let top = (size.rows - height) / 2;
+                    let overlay_size = wezterm_term::TerminalSize {
+                        cols: width,
+                        rows: height,
+                        pixel_width: width * self.render_metrics.cell_size.width as usize,
+                        pixel_height: height * self.render_metrics.cell_size.height as usize,
+                        dpi: size.dpi,
+                    };
+                    let dimensions = pane.get_dimensions();
+                    if dimensions.cols != width || dimensions.viewport_rows != height {
+                        if let Err(err) = pane.resize(overlay_size) {
+                            log::error!("unable to resize centered overlay: {err:#}");
+                        }
+                    }
+
+                    let mut panes = tab.iter_panes();
+                    for pane in &mut panes {
+                        pane.is_active = false;
+                    }
+                    panes.push(PositionedPane {
+                        index: panes.len(),
+                        is_active: true,
+                        is_zoomed: false,
+                        left,
+                        top,
+                        width,
+                        height,
+                        pixel_width: overlay_size.pixel_width,
+                        pixel_height: overlay_size.pixel_height,
+                        pane,
+                    });
+                    panes
+                }
+            }
         } else {
             let mut panes = tab.iter_panes();
             for p in &mut panes {
@@ -3589,6 +3656,7 @@ impl TermWindow {
         self.pane_state(pane_id).overlay.replace(OverlayState {
             pane,
             key_table_state: KeyTableState::default(),
+            presentation: OverlayPresentation::Full,
         });
         self.update_title();
     }
@@ -3598,8 +3666,31 @@ impl TermWindow {
         self.tab_state(tab_id).overlay.replace(OverlayState {
             pane: overlay,
             key_table_state: KeyTableState::default(),
+            presentation: OverlayPresentation::Full,
         });
         self.update_title();
+    }
+
+    pub fn assign_centered_overlay(&mut self, tab_id: TabId, overlay: Arc<dyn Pane>) {
+        self.cancel_overlay_for_tab(tab_id, None);
+        self.tab_state(tab_id).overlay.replace(OverlayState {
+            pane: overlay,
+            key_table_state: KeyTableState::default(),
+            presentation: OverlayPresentation::Centered {
+                width_percent: 70,
+                height_percent: 70,
+            },
+        });
+        self.update_title();
+    }
+
+    pub fn is_centered_overlay_pane(&self, pane_id: PaneId) -> bool {
+        self.tab_state.borrow().values().any(|state| {
+            state.overlay.as_ref().is_some_and(|overlay| {
+                overlay.pane.pane_id() == pane_id
+                    && matches!(overlay.presentation, OverlayPresentation::Centered { .. })
+            })
+        })
     }
 
     fn resolve_search_pattern(&self, pattern: Pattern, pane: &Arc<dyn Pane>) -> MuxPattern {

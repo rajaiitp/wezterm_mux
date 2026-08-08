@@ -250,6 +250,33 @@ impl crate::TermWindow {
         }
 
         for pos in panes {
+            let centered_overlay = self.is_centered_overlay_pane(pos.pane.pane_id());
+            if centered_overlay {
+                let tab_bar_height = if self.show_tab_bar {
+                    self.tab_bar_pixel_height()
+                        .context("tab_bar_pixel_height")?
+                } else {
+                    0.
+                };
+                let terminal_top = if self.config.tab_bar_at_bottom {
+                    0.
+                } else {
+                    tab_bar_height
+                };
+                self.filled_rectangle(
+                    &mut layers,
+                    0,
+                    euclid::rect(
+                        0.,
+                        terminal_top,
+                        self.dimensions.pixel_width as f32,
+                        self.dimensions.pixel_height as f32 - tab_bar_height,
+                    ),
+                    window::color::LinearRgba::with_components(0., 0., 0., 0.48),
+                )
+                .context("dim background behind centered overlay")?;
+            }
+
             if pos.is_active {
                 self.update_text_cursor(&pos);
                 if focused {
@@ -257,7 +284,57 @@ impl crate::TermWindow {
                     mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
                 }
             }
-            self.paint_pane(&pos, &mut layers).context("paint_pane")?;
+            if centered_overlay {
+                // Keep the popup above all underlying pane layers so its
+                // background fully occludes text and images beneath it.
+                let popup_layer = self
+                    .render_state
+                    .as_ref()
+                    .expect("render state")
+                    .layer_for_zindex(50)
+                    .context("allocate centered overlay render layer")?;
+                let mut popup_layers = popup_layer.quad_allocator();
+                self.paint_pane(&pos, &mut popup_layers)
+                    .context("paint centered overlay pane")?;
+
+                let cell_width = self.render_metrics.cell_size.width as f32;
+                let cell_height = self.render_metrics.cell_size.height as f32;
+                let (padding_left, padding_top) = self.padding_left_top();
+                let tab_bar_height = if self.show_tab_bar {
+                    self.tab_bar_pixel_height()
+                        .context("tab_bar_pixel_height")?
+                } else {
+                    0.
+                };
+                let top_bar_height = if self.config.tab_bar_at_bottom {
+                    0.
+                } else {
+                    tab_bar_height
+                };
+                let os_border = self.get_os_border();
+                let x = padding_left + os_border.left.get() as f32 + pos.left as f32 * cell_width
+                    - cell_width / 2.;
+                let y = top_bar_height
+                    + padding_top
+                    + os_border.top.get() as f32
+                    + pos.top as f32 * cell_height
+                    - cell_height / 2.;
+                let width = pos.width as f32 * cell_width + cell_width;
+                let height = pos.height as f32 * cell_height + cell_height;
+                let thickness = 2.;
+                let color = self.palette().colors.0[5].to_linear();
+                for rect in [
+                    euclid::rect(x, y, width, thickness),
+                    euclid::rect(x, y + height - thickness, width, thickness),
+                    euclid::rect(x, y, thickness, height),
+                    euclid::rect(x + width - thickness, y, thickness, height),
+                ] {
+                    self.filled_rectangle(&mut popup_layers, 0, rect, color)
+                        .context("paint centered overlay border")?;
+                }
+            } else {
+                self.paint_pane(&pos, &mut layers).context("paint_pane")?;
+            }
         }
 
         if let Some(pane) = self.get_active_pane_or_overlay() {

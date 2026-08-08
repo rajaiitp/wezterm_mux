@@ -596,7 +596,8 @@ fn spawn_command_from_action(action: &KeyAssignment) -> Option<&SpawnCommand> {
         SplitHorizontal(command)
         | SplitVertical(command)
         | SpawnCommandInNewWindow(command)
-        | SpawnCommandInNewTab(command) => Some(command),
+        | SpawnCommandInNewTab(command)
+        | SpawnCommandInOverlay(command) => Some(command),
         _ => None,
     }
 }
@@ -993,6 +994,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             args: &[],
             menubar: &[],
             icon: Some("md_open_in_new"),
+        },
+        SpawnCommandInOverlay(cmd) => CommandDef {
+            brief: label_string(action, format!("Spawn an overlay with {cmd:?}")).into(),
+            doc: format!("Spawn an in-window command overlay with {cmd:?}").into(),
+            keys: vec![],
+            args: &[],
+            menubar: &[],
+            icon: None,
         },
         ActivateTab(-1) => CommandDef {
             brief: "Activate right-most tab".into(),
