@@ -96,7 +96,7 @@ export default function (pi) {
       name: "terminal_run",
       label: "Run Terminal Command",
       description:
-        "Run a visible command in Pi's managed terminal pool. Return only an opaque command ID; output and interaction stay available through that ID.",
+        "Start a visible command asynchronously in Pi's managed terminal pool and return its opaque command ID. Pass argv directly; use [\"bash\", \"-lc\", SCRIPT] for shell syntax. Never sleep or poll for completion: a command.finished follow-up arrives automatically with status and output.",
       parameters: Type.Object({
         command: Type.Array(Type.String()),
         cwd: Type.Optional(Type.String()),
@@ -115,7 +115,7 @@ export default function (pi) {
       name: "terminal_read",
       label: "Read Terminal Output",
       description:
-        "Read the retained output buffer for a command. Without a range, return the most recent output.",
+        "Read a command's retained output buffer, optionally by range. Use this for output needed while a command is still running or for later inspection; do not repeatedly call it to detect completion because command.finished is delivered automatically.",
       parameters: Type.Object({
         commandId: Type.String(),
         start: Type.Optional(Type.Integer()),
@@ -134,7 +134,7 @@ export default function (pi) {
     pi.registerTool({
       name: "terminal_command",
       label: "Cancel, Inspect, or Close Command",
-      description: "Inspect status, cancel, or explicitly close a managed command pane by command ID.",
+      description: "Perform a one-shot result inspection, send Ctrl-C with cancel, or explicitly close a managed command pane. Do not poll result for completion; wait for the automatic command.finished follow-up.",
       parameters: Type.Object({
         operation: Type.String({ description: "result, cancel, or close" }),
         commandId: Type.String(),
@@ -162,10 +162,12 @@ export default function (pi) {
     pi.registerTool({
       name: "terminal_input",
       label: "Interact with Terminal",
-      description: "Send visible user-style text to a managed command shell, including Ctrl-C or follow-up input.",
+      description: "Send exact keyboard-style input to a running managed command. End each submitted line with \\n, and send multiple responses as separate calls when interaction requires it. Use \\u0003 for Ctrl-C. Completion still arrives through the automatic command.finished follow-up; do not poll afterward.",
       parameters: Type.Object({
         commandId: Type.String(),
-        text: Type.String(),
+        text: Type.String({
+          description: "Exact terminal input. Include a trailing \\n to submit a line.",
+        }),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         const response = await call("command.input", {

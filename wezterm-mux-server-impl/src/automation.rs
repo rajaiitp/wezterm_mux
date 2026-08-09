@@ -977,6 +977,18 @@ fn run_mutation_on_main(method: String, params: Value) -> anyhow::Result<Value> 
         .map_err(|err| anyhow!("main-thread request failed: {err}"))?
 }
 
+fn send_user_input(pane: &dyn mux::pane::Pane, text: &str) -> anyhow::Result<()> {
+    // Automation input represents terminal keystrokes, not a clipboard paste.
+    // Pane::send_paste enables bracketed-paste mode, causing shells to insert
+    // newlines and control bytes into their edit buffer instead of acting on
+    // them. Write directly to the PTY so Enter, Ctrl-C, and prompt responses
+    // have the same semantics as user input.
+    let mut writer = pane.writer();
+    writer.write_all(text.as_bytes())?;
+    writer.flush()?;
+    Ok(())
+}
+
 async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
     let params = object_params(Some(params))?;
     let mux = Mux::get();
@@ -1040,7 +1052,7 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 // The managed shell's prompt hook reports the resulting 130
                 // status through the callback FIFO once Ctrl-C returns it to
                 // the prompt. The shell and pane remain reusable.
-                pane.send_paste("\u{3}")?;
+                send_user_input(pane.as_ref(), "\u{3}")?;
             }
             Ok(json!({
                 "cancelled": record.running,
@@ -1064,7 +1076,7 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
             let pane = mux
                 .get_pane(record.pane_id)
                 .ok_or_else(|| anyhow!("command pane is no longer available"))?;
-            pane.send_paste(text)?;
+            send_user_input(pane.as_ref(), text)?;
             Ok(json!({ "commandId": command_id, "sent": text.len() }))
         }
         "command.close" => {
@@ -1228,7 +1240,7 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 .unwrap()
                 .insert(command_id.clone(), record);
             watch_command(command_id.clone(), pane.pane_id());
-            if let Err(error) = pane.send_paste(&script) {
+            if let Err(error) = send_user_input(pane.as_ref(), &script) {
                 MANAGED_COMMANDS.lock().unwrap().remove(&command_id);
                 return Err(error.into());
             }
@@ -1562,11 +1574,20 @@ fn start_shell_callback(pane_id: PaneId, callback_fifo: PathBuf, cleanup_dir: Pa
                 // Keep the writer open while the blocking reader is alive;
                 // shell prompt writes remain the only completion notifications.
                 let _writer = writer;
+                let mut initial_prompt_seen = false;
                 for line in BufReader::new(reader).lines() {
                     let Ok(line) = line else { break };
-                    if let Ok(exit_code) = line.trim().parse::<i32>() {
-                        finish_running_command(pane_id, exit_code);
+                    let Ok(exit_code) = line.trim().parse::<i32>() else {
+                        continue;
+                    };
+                    // Every managed shell invokes its prompt hook once during
+                    // startup. A command may already be queued in the PTY by
+                    // then, so never treat that first prompt as its completion.
+                    if !initial_prompt_seen {
+                        initial_prompt_seen = true;
+                        continue;
                     }
+                    finish_running_command(pane_id, exit_code);
                 }
             }
             let _ = fs::remove_dir_all(&cleanup_dir);

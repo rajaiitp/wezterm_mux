@@ -26,5 +26,7 @@ panes: one side panel, then stacked panes within it. Commands reuse idle shell
 panes instead of opening or closing panes repeatedly. Completion is an event
 callback, not a polling loop; panes remain visible, readable, and interactive.
 The extension does not inject a full mux/topology snapshot into Pi context. All
-operations use the native typed JSON-RPC socket; no `wezterm cli` subprocesses
-or screen scraping are used.
+`terminal_input` writes keyboard-style bytes directly rather than using
+bracketed paste, so a trailing `\n` submits a prompt response and control bytes
+such as Ctrl-C take effect. All operations use the native typed JSON-RPC socket;
+no `wezterm cli` subprocesses or screen scraping are used.
