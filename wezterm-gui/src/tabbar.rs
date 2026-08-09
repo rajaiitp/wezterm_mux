@@ -672,11 +672,17 @@ impl TabBarState {
         let status_space_available = title_width.saturating_sub(x);
 
         let mut right_status_line = parse_status_text(right_status, black_cell.attrs().clone());
+        // The status text is right-aligned into the remaining tab-bar space,
+        // but only the rendered status pill should be clickable. The previous
+        // hitbox covered every unused cell after the tabs, so clicking blank
+        // tab-bar space unexpectedly opened the workspace selector.
+        let right_status_width = right_status_line.len().min(status_space_available);
+        let right_status_x = title_width.saturating_sub(right_status_width);
         items.push(TabEntry {
             item: TabBarItem::RightStatus,
             title: right_status_line.clone(),
-            x,
-            width: status_space_available,
+            x: right_status_x,
+            width: right_status_width,
         });
 
         while right_status_line.len() > status_space_available {

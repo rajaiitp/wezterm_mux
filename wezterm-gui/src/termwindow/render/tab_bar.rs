@@ -92,6 +92,7 @@ impl crate::TermWindow {
                 white_space,
                 filled_box,
                 window_is_transparent,
+                pane_background_opacity: 1.0,
                 default_bg,
                 style: None,
                 font: None,

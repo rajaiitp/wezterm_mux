@@ -1,7 +1,7 @@
 use anyhow::Context;
 use chrono::Utc;
 use codec::ListPanesResponse;
-use mux::Mux;
+use mux::{is_ephemeral_workspace, Mux};
 use promise::spawn::spawn;
 use serde::Serialize;
 use smol::Timer;
@@ -117,6 +117,9 @@ fn capture_mux() -> ListPanesResponse {
     let mut active_tabs = std::collections::HashMap::new();
     for window_id in mux.iter_windows() {
         if let Some(window) = mux.get_window(window_id) {
+            if is_ephemeral_workspace(window.get_workspace()) {
+                continue;
+            }
             if let Some(tab) = window.get_active() {
                 active_tabs.insert(window_id, tab.tab_id());
             }

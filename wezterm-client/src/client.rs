@@ -270,7 +270,9 @@ fn process_unilateral(
             promise::spawn::spawn_into_main_thread(async move {
                 let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
                 log::debug!("got a rename {old_workspace} -> {new_workspace}");
-                mux.rename_workspace(&old_workspace, &new_workspace);
+                if let Err(err) = mux.rename_workspace(&old_workspace, &new_workspace) {
+                    log::warn!("remote workspace rename rejected: {err:#}");
+                }
                 anyhow::Result::<()>::Ok(())
             })
             .detach();
@@ -299,19 +301,47 @@ fn process_unilateral(
         }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
             log::trace!("resync due to {:?}", decoded.pdu);
+            let inner = match ClientDomain::get_client_inner_for_domain(local_domain_id) {
+                Ok(inner) => inner,
+                Err(err) => {
+                    log::debug!("unable to schedule tab resync: {err:#}");
+                    return Ok(());
+                }
+            };
+            if !inner.request_tab_resync() {
+                // A resync is already queued. Its generation counter records
+                // this notification and the running task will perform one
+                // trailing pass after the live-resize burst settles.
+                return Ok(());
+            }
+
             promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
-                let client_domain = mux
-                    .get_domain(local_domain_id)
-                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
-                let client_domain =
-                    client_domain
+                let mut generation = inner.tab_resync_generation();
+                loop {
+                    // Wayland emits a stream of configure events while the
+                    // user drags a window. Let those events coalesce instead
+                    // of launching one full ListPanes request per configure.
+                    smol::Timer::after(Duration::from_millis(50)).await;
+
+                    let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                    let client_domain = mux
+                        .get_domain(local_domain_id)
+                        .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                    let client_domain = client_domain
                         .downcast_ref::<ClientDomain>()
                         .ok_or_else(|| {
                             anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
                         })?;
 
-                client_domain.resync().await
+                    let result = client_domain.resync().await;
+                    let again = inner.finish_tab_resync(generation);
+                    result?;
+                    if !again {
+                        break;
+                    }
+                    generation = inner.tab_resync_generation();
+                }
+                Ok::<(), anyhow::Error>(())
             })
             .detach();
 
@@ -1381,6 +1411,7 @@ impl Client {
     rpc!(set_client_id, SetClientId, UnitResponse);
     rpc!(list_clients, GetClientList = (), GetClientListResponse);
     rpc!(set_window_workspace, SetWindowWorkspace, UnitResponse);
+    rpc!(set_client_workspace, SetClientWorkspace, UnitResponse);
     rpc!(set_focused_pane_id, SetFocusedPane, UnitResponse);
     rpc!(get_image_cell, GetImageCell, GetImageCellResponse);
     rpc!(set_configured_palette_for_pane, SetPalette, UnitResponse);

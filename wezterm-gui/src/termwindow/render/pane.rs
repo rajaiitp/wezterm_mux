@@ -93,8 +93,16 @@ impl crate::TermWindow {
         let white_space = gl_state.util_sprites.white_space.texture_coords();
         let filled_box = gl_state.util_sprites.filled_box.texture_coords();
 
-        let window_is_transparent =
-            !self.window_background.is_empty() || config.window_background_opacity != 1.0;
+        let pane_background_opacity = if pos.is_active {
+            config.active_pane_opacity
+        } else {
+            config.inactive_pane_opacity
+        };
+        let pane_backgrounds_are_transparent =
+            config.active_pane_opacity < 1.0 || config.inactive_pane_opacity < 1.0;
+        let window_is_transparent = !self.window_background.is_empty()
+            || config.window_background_opacity != 1.0
+            || pane_backgrounds_are_transparent;
 
         let default_bg = palette
             .resolve_bg(ColorAttribute::Default)
@@ -102,7 +110,7 @@ impl crate::TermWindow {
             .mul_alpha(if window_is_transparent {
                 0.
             } else {
-                config.text_background_opacity
+                config.text_background_opacity * pane_background_opacity
             });
 
         let cell_width = self.render_metrics.cell_size.width as f32;
@@ -162,7 +170,7 @@ impl crate::TermWindow {
                     palette
                         .background
                         .to_linear()
-                        .mul_alpha(config.window_background_opacity),
+                        .mul_alpha(config.window_background_opacity * pane_background_opacity),
                 )
                 .context("filled_rectangle")?;
             quad.set_hsv(if pos.is_active {
@@ -191,14 +199,19 @@ impl crate::TermWindow {
                 let background = if window_is_transparent {
                     // for transparent windows, we fade in the target color
                     // by adjusting its alpha
-                    LinearRgba::with_components(r, g, b, intensity)
+                    LinearRgba::with_components(
+                        r,
+                        g,
+                        b,
+                        intensity * pane_background_opacity,
+                    )
                 } else {
                     // otherwise We'll interpolate between the background color
                     // and the target color
                     let (r1, g1, b1, a) = palette
                         .background
                         .to_linear()
-                        .mul_alpha(config.window_background_opacity)
+                        .mul_alpha(config.window_background_opacity * pane_background_opacity)
                         .tuple();
                     LinearRgba::with_components(
                         r1 + (r - r1) * intensity,
@@ -333,6 +346,7 @@ impl crate::TermWindow {
                 white_space: TextureRect,
                 filled_box: TextureRect,
                 window_is_transparent: bool,
+                pane_background_opacity: f32,
                 layers: &'a mut TripleLayerQuadAllocator<'b>,
                 error: Option<anyhow::Error>,
             }
@@ -363,6 +377,7 @@ impl crate::TermWindow {
                 white_space,
                 filled_box,
                 window_is_transparent,
+                pane_background_opacity,
                 layers,
                 error: None,
             };
@@ -473,6 +488,8 @@ impl crate::TermWindow {
                     let shape_key = LineToEleShapeCacheKey {
                         shape_hash,
                         shape_generation: quad_key.shape_generation,
+                        pane_background_opacity: NotNan::new(self.pane_background_opacity)
+                            .expect("pane opacity must be finite"),
                         composing: if self.cursor.y == stable_row && self.pos.is_active {
                             if let DeadKeyStatus::Composing(composing) =
                                 &self.term_window.dead_key_status
@@ -513,6 +530,7 @@ impl crate::TermWindow {
                                 white_space: self.white_space,
                                 filled_box: self.filled_box,
                                 window_is_transparent: self.window_is_transparent,
+                                pane_background_opacity: self.pane_background_opacity,
                                 default_bg: self.default_bg,
                                 font: None,
                                 style: None,
@@ -655,6 +673,11 @@ impl crate::TermWindow {
         );
 
         let palette = pos.pane.palette();
+        let pane_background_opacity = if pos.is_active {
+            self.config.active_pane_opacity
+        } else {
+            self.config.inactive_pane_opacity
+        };
 
         // TODO: visual bell background layer
         // TODO: scrollbar
@@ -672,7 +695,7 @@ impl crate::TermWindow {
                     palette
                         .background
                         .to_linear()
-                        .mul_alpha(self.config.window_background_opacity)
+                        .mul_alpha(self.config.window_background_opacity * pane_background_opacity)
                         .into()
                 } else {
                     InheritableColor::Inherited

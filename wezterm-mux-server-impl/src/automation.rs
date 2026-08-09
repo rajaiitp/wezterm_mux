@@ -16,7 +16,7 @@ use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_main_thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -28,7 +28,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 use wezterm_term::StableRowIndex;
@@ -39,6 +39,8 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 const MAIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MANAGED_PANES: usize = 3;
+const MAX_COMMAND_OUTPUT_LINES: usize = 4096;
+const PROMPT_MARKER_PREFIX: &str = "PI_WEZTERM_PROMPT_";
 
 #[derive(Clone, Debug)]
 struct ManagedCommand {
@@ -49,6 +51,10 @@ struct ManagedCommand {
     signal: Option<String>,
     success: Option<bool>,
     reason: Option<String>,
+    output_start_y: StableRowIndex,
+    output_start_x: usize,
+    captured_output: Option<String>,
+    output_truncated: bool,
 }
 
 struct ManagedShellSetup {
@@ -125,6 +131,12 @@ lazy_static::lazy_static! {
     static ref CLIENT_ORIGINS: Mutex<HashMap<String, Option<PaneId>>> = Mutex::new(HashMap::new());
     static ref MANAGED_PANES: Mutex<HashMap<PaneId, Vec<PaneId>>> = Mutex::new(HashMap::new());
     static ref MANAGED_COMMANDS: Mutex<HashMap<String, ManagedCommand>> = Mutex::new(HashMap::new());
+    // A physical pane can be reused, but only its latest command ID may
+    // control it. Older IDs retain immutable output and status records.
+    static ref MANAGED_PANE_OWNERS: Mutex<HashMap<PaneId, String>> = Mutex::new(HashMap::new());
+    static ref PROMPT_MARKERS: (Mutex<HashMap<PaneId, u64>>, Condvar) =
+        (Mutex::new(HashMap::new()), Condvar::new());
+    static ref SHELL_READY: (Mutex<HashSet<PaneId>>, Condvar) = (Mutex::new(HashSet::new()), Condvar::new());
     static ref SHELL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 }
 
@@ -536,14 +548,19 @@ fn dispatch_request(
                 .ok_or_else(|| anyhow!("command {command_id} not found"))?;
             let start = params.get("start").and_then(Value::as_i64);
             let end = params.get("end").and_then(Value::as_i64);
-            let output = pane_text(record.pane_id, start, end)?
-                .get("text")
-                .cloned()
-                .unwrap_or(Value::String(String::new()));
+            let (output, range_start, range_end, truncated) =
+                read_managed_command_output(&record, start, end)?;
             send_result(
                 out,
                 id,
-                json!({ "commandId": command_id, "output": output }),
+                json!({
+                    "commandId": command_id,
+                    "output": output,
+                    "start": range_start,
+                    "end": range_end,
+                    "running": record.running,
+                    "truncated": truncated
+                }),
             )
         }
         "command.getResult" => {
@@ -638,6 +655,27 @@ fn managed_command_result(command_id: &str, command: &ManagedCommand) -> Value {
         "success": command.success,
         "reason": command.reason,
     })
+}
+
+fn ensure_command_owns_pane(command_id: &str, command: &ManagedCommand) -> anyhow::Result<()> {
+    let owners = MANAGED_PANE_OWNERS.lock().unwrap();
+    anyhow::ensure!(
+        owners
+            .get(&command.pane_id)
+            .is_some_and(|owner| owner == command_id),
+        "command {command_id} no longer owns its managed pane"
+    );
+    Ok(())
+}
+
+fn clear_command_pane_owner(command_id: &str, pane_id: PaneId) {
+    let mut owners = MANAGED_PANE_OWNERS.lock().unwrap();
+    if owners
+        .get(&pane_id)
+        .is_some_and(|owner| owner == command_id)
+    {
+        owners.remove(&pane_id);
+    }
 }
 
 fn send_result(out: &mpsc::SyncSender<String>, id: Value, result: Value) {
@@ -930,6 +968,108 @@ fn pane_text(pane_id: PaneId, start: Option<i64>, end: Option<i64>) -> anyhow::R
     Ok(json!({ "paneId": pane_id, "start": first, "end": end, "text": text }))
 }
 
+fn capture_managed_command_output(command: &ManagedCommand) -> anyhow::Result<(String, bool)> {
+    if let Some(output) = &command.captured_output {
+        return Ok((output.clone(), command.output_truncated));
+    }
+
+    let pane = Mux::get()
+        .get_pane(command.pane_id)
+        .ok_or_else(|| anyhow!("command pane is no longer available"))?;
+    let dims = pane.get_dimensions();
+    let cursor = pane.get_cursor_position();
+    let mut start = command.output_start_y.max(dims.scrollback_top);
+    let mut truncated = start > command.output_start_y;
+    let end = cursor.y.saturating_add(1).max(start.saturating_add(1));
+    let earliest_retained = end.saturating_sub(MAX_COMMAND_OUTPUT_LINES as StableRowIndex);
+    if start < earliest_retained {
+        start = earliest_retained;
+        truncated = true;
+    }
+
+    let (first, lines) = pane.get_lines(start..end);
+    if first > start {
+        truncated = true;
+    }
+    let mut text = String::new();
+    for (index, line) in lines.into_iter().enumerate() {
+        if index > 0 {
+            text.push('\n');
+        }
+        let stable_row = first + index as StableRowIndex;
+        let first_column = if stable_row == command.output_start_y {
+            command.output_start_x
+        } else {
+            0
+        };
+        let mut rendered = String::new();
+        for cell in line
+            .visible_cells()
+            .skip_while(|cell| cell.cell_index() < first_column)
+        {
+            rendered.push_str(cell.str());
+        }
+        text.push_str(rendered.trim_end());
+        if text.len() > MAX_TEXT_BYTES {
+            let mut boundary = MAX_TEXT_BYTES;
+            while !text.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            text.truncate(boundary);
+            truncated = true;
+            break;
+        }
+    }
+
+    Ok((text.trim_end_matches('\n').to_string(), truncated))
+}
+
+fn slice_command_output(
+    output: &str,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> anyhow::Result<(String, usize, usize)> {
+    anyhow::ensure!(
+        start.is_none_or(|value| value >= 0),
+        "start must be non-negative"
+    );
+    anyhow::ensure!(
+        end.is_none_or(|value| value >= 0),
+        "end must be non-negative"
+    );
+    let lines = if output.is_empty() {
+        Vec::new()
+    } else {
+        output.split('\n').collect::<Vec<_>>()
+    };
+    let end = end.map(|value| value as usize).unwrap_or(lines.len());
+    let start = start
+        .map(|value| value as usize)
+        .unwrap_or_else(|| end.saturating_sub(MAX_COMMAND_OUTPUT_LINES));
+    anyhow::ensure!(start <= end, "start must not exceed end");
+    anyhow::ensure!(
+        end.saturating_sub(start) <= MAX_COMMAND_OUTPUT_LINES,
+        "requested output range is too large"
+    );
+    let bounded_start = start.min(lines.len());
+    let bounded_end = end.min(lines.len()).max(bounded_start);
+    Ok((
+        lines[bounded_start..bounded_end].join("\n"),
+        bounded_start,
+        bounded_end,
+    ))
+}
+
+fn read_managed_command_output(
+    command: &ManagedCommand,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> anyhow::Result<(String, usize, usize, bool)> {
+    let (output, truncated) = capture_managed_command_output(command)?;
+    let (output, start, end) = slice_command_output(&output, start, end)?;
+    Ok((output, start, end, truncated))
+}
+
 fn semantic_zones(pane_id: PaneId) -> anyhow::Result<Value> {
     let pane = Mux::get()
         .get_pane(pane_id)
@@ -1042,13 +1182,14 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 .get(&command_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("command {command_id} not found"))?;
-            let pane = mux
-                .get_pane(record.pane_id)
-                .ok_or_else(|| anyhow!("pane {} not found", record.pane_id))?;
+            ensure_command_owns_pane(&command_id, &record)?;
             // Interrupt the command inside its persistent shell. Do not kill
             // the shell or close the pane; it remains available for reuse and
             // for direct user interaction.
             if record.running {
+                let pane = mux
+                    .get_pane(record.pane_id)
+                    .ok_or_else(|| anyhow!("pane {} not found", record.pane_id))?;
                 // The managed shell's prompt hook reports the resulting 130
                 // status through the callback FIFO once Ctrl-C returns it to
                 // the prompt. The shell and pane remain reusable.
@@ -1073,6 +1214,8 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 .get(&command_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("command {command_id} not found"))?;
+            ensure_command_owns_pane(&command_id, &record)?;
+            anyhow::ensure!(record.running, "command {command_id} has already finished");
             let pane = mux
                 .get_pane(record.pane_id)
                 .ok_or_else(|| anyhow!("command pane is no longer available"))?;
@@ -1087,10 +1230,15 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 .get(&command_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("command {command_id} not found"))?;
+            ensure_command_owns_pane(&command_id, &record)?;
             anyhow::ensure!(
                 mux.get_pane(record.pane_id).is_some(),
                 "command pane is already closed"
             );
+            if record.running {
+                finish_command(&command_id, None, None, Some(false), Some("pane-closed"));
+            }
+            clear_command_pane_owner(&command_id, record.pane_id);
             mux.remove_pane(record.pane_id);
             Ok(json!({ "commandId": command_id, "closed": true }))
         }
@@ -1120,7 +1268,7 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 .or_else(|| params.get("newWorkspace"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("new workspace is required"))?;
-            mux.rename_workspace(old, new);
+            mux.rename_workspace(old, new)?;
             Ok(json!({ "old": old, "new": new }))
         }
         "tab.focus" => {
@@ -1223,6 +1371,7 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
             let sequence = REVISION.fetch_add(1, Ordering::Relaxed);
             let command_id = format!("command-{sequence}");
             let script = managed_command_script(command, cwd.as_deref())?;
+            let output_start = pane.get_cursor_position();
             let record = ManagedCommand {
                 pane_id: pane.pane_id(),
                 owner_client_id: params
@@ -1234,14 +1383,23 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 signal: None,
                 success: None,
                 reason: None,
+                output_start_y: output_start.y,
+                output_start_x: output_start.x,
+                captured_output: None,
+                output_truncated: false,
             };
             MANAGED_COMMANDS
                 .lock()
                 .unwrap()
                 .insert(command_id.clone(), record);
+            MANAGED_PANE_OWNERS
+                .lock()
+                .unwrap()
+                .insert(pane.pane_id(), command_id.clone());
             watch_command(command_id.clone(), pane.pane_id());
             if let Err(error) = send_user_input(pane.as_ref(), &script) {
                 MANAGED_COMMANDS.lock().unwrap().remove(&command_id);
+                clear_command_pane_owner(&command_id, pane.pane_id());
                 return Err(error.into());
             }
 
@@ -1279,7 +1437,7 @@ async fn ensure_managed_pane(
     // origin pane's tab. Moving it elsewhere removes it from this pool but
     // never closes the user's pane.
     pool.retain(|pane_id| {
-        mux.get_pane(*pane_id).is_some()
+        mux.get_pane(*pane_id).is_some_and(|pane| !pane.is_dead())
             && mux
                 .resolve_pane_id(*pane_id)
                 .is_some_and(|(_, window_id, tab_id)| {
@@ -1335,7 +1493,10 @@ async fn ensure_managed_pane(
         )
         .await?;
     let pane_id = pane.pane_id();
-    start_shell_callback(pane_id, callback_fifo, cleanup_dir);
+    if let Err(error) = start_shell_callback(pane_id, callback_fifo, cleanup_dir) {
+        mux.remove_pane(pane_id);
+        return Err(error);
+    }
     pool.push(pane_id);
     if pool.len() == MAX_MANAGED_PANES {
         balance_managed_panel(origin_tab_id, &pool);
@@ -1416,11 +1577,14 @@ fn broadcast_event_to(target_client_id: Option<&str>, event: &str, data: Value) 
 }
 
 fn pane_is_busy(pane_id: PaneId) -> bool {
-    MANAGED_COMMANDS
-        .lock()
-        .unwrap()
-        .values()
-        .any(|command| command.pane_id == pane_id && command.running)
+    let command_id = MANAGED_PANE_OWNERS.lock().unwrap().get(&pane_id).cloned();
+    command_id.is_some_and(|command_id| {
+        MANAGED_COMMANDS
+            .lock()
+            .unwrap()
+            .get(&command_id)
+            .is_some_and(|command| command.running)
+    })
 }
 
 fn shell_quote(value: &str) -> anyhow::Result<String> {
@@ -1521,7 +1685,9 @@ fn prepare_managed_shell() -> anyhow::Result<ManagedShellSetup> {
             "if [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n\
 __pi_wezterm_prompt() {{\n\
   local __pi_status=$?\n\
-  printf '%s\\n' \"$__pi_status\" > {fifo}\n\
+  __pi_wezterm_prompt_seq=$(( ${{__pi_wezterm_prompt_seq:-0}} + 1 ))\n\
+  printf '\\033]1337;SetUserVar=PI_WEZTERM_PROMPT_%s=\\007' \"$__pi_wezterm_prompt_seq\"\n\
+  printf '%s %s\\n' \"$__pi_status\" \"$__pi_wezterm_prompt_seq\" > {fifo}\n\
   return $__pi_status\n\
 }}\n\
 if declare -p PROMPT_COMMAND >/dev/null 2>&1 && declare -p PROMPT_COMMAND | grep -q 'declare -a'; then\n\
@@ -1538,7 +1704,9 @@ fi\n",
         let rc = format!(
             "__pi_wezterm_prompt() {{\n\
   __pi_status=$?\n\
-  printf '%s\\n' \"$__pi_status\" > {fifo}\n\
+  __pi_wezterm_prompt_seq=$(( ${{__pi_wezterm_prompt_seq:-0}} + 1 ))\n\
+  printf '\\033]1337;SetUserVar=PI_WEZTERM_PROMPT_%s=\\007' \"$__pi_wezterm_prompt_seq\"\n\
+  printf '%s %s\\n' \"$__pi_status\" \"$__pi_wezterm_prompt_seq\" > {fifo}\n\
   return $__pi_status\n\
 }}\n\n__pi_wezterm_prompt\n",
         );
@@ -1553,46 +1721,127 @@ fi\n",
     })
 }
 
-fn start_shell_callback(pane_id: PaneId, callback_fifo: PathBuf, cleanup_dir: PathBuf) {
-    #[cfg(unix)]
-    let (reader, writer) = match open_callback_fifo(&callback_fifo) {
-        Ok(handles) => handles,
-        Err(error) => {
-            log::debug!("managed shell callback {} ended: {error}", pane_id);
-            let _ = fs::remove_dir_all(&cleanup_dir);
-            return;
-        }
-    };
-    #[cfg(not(unix))]
-    let _ = (pane_id, callback_fifo, cleanup_dir);
-
-    thread::Builder::new()
-        .name(format!("wezterm-shell-callback-{pane_id}"))
-        .spawn(move || {
-            #[cfg(unix)]
+fn watch_prompt_markers(pane_id: PaneId) {
+    Mux::get().subscribe(move |notification| match notification {
+        MuxNotification::Alert {
+            pane_id: marker_pane_id,
+            alert: wezterm_term::Alert::SetUserVar { name, .. },
+        } if marker_pane_id == pane_id => {
+            if let Some(sequence) = name
+                .strip_prefix(PROMPT_MARKER_PREFIX)
+                .and_then(|value| value.parse::<u64>().ok())
             {
+                let (markers, changed) = &*PROMPT_MARKERS;
+                let mut markers = markers.lock().unwrap();
+                markers.insert(pane_id, sequence);
+                changed.notify_all();
+            }
+            true
+        }
+        MuxNotification::PaneRemoved(removed_pane_id) if removed_pane_id == pane_id => false,
+        _ => true,
+    });
+}
+
+fn wait_for_prompt_marker(pane_id: PaneId, sequence: u64) -> bool {
+    let (markers, changed) = &*PROMPT_MARKERS;
+    let markers = markers.lock().unwrap();
+    let (markers, _) = changed
+        .wait_timeout_while(markers, Duration::from_secs(5), |markers| {
+            markers
+                .get(&pane_id)
+                .is_none_or(|observed| *observed < sequence)
+        })
+        .unwrap();
+    markers
+        .get(&pane_id)
+        .is_some_and(|observed| *observed >= sequence)
+}
+
+fn mark_shell_ready(pane_id: PaneId) {
+    let (ready, changed) = &*SHELL_READY;
+    ready.lock().unwrap().insert(pane_id);
+    changed.notify_all();
+}
+
+fn wait_for_shell_ready(pane_id: PaneId) -> bool {
+    let (ready, changed) = &*SHELL_READY;
+    let ready = ready.lock().unwrap();
+    let (ready, _) = changed
+        .wait_timeout_while(ready, Duration::from_secs(5), |ready| {
+            !ready.contains(&pane_id)
+        })
+        .unwrap();
+    ready.contains(&pane_id)
+}
+
+fn start_shell_callback(
+    pane_id: PaneId,
+    callback_fifo: PathBuf,
+    cleanup_dir: PathBuf,
+) -> anyhow::Result<()> {
+    watch_prompt_markers(pane_id);
+    let (ready, _) = &*SHELL_READY;
+    ready.lock().unwrap().remove(&pane_id);
+
+    #[cfg(unix)]
+    {
+        let (reader, writer) = open_callback_fifo(&callback_fifo)
+            .with_context(|| format!("open managed shell callback {}", callback_fifo.display()))?;
+        thread::Builder::new()
+            .name(format!("wezterm-shell-callback-{pane_id}"))
+            .spawn(move || {
                 // Keep the writer open while the blocking reader is alive;
                 // shell prompt writes remain the only completion notifications.
                 let _writer = writer;
                 let mut initial_prompt_seen = false;
                 for line in BufReader::new(reader).lines() {
                     let Ok(line) = line else { break };
-                    let Ok(exit_code) = line.trim().parse::<i32>() else {
+                    let mut fields = line.split_whitespace();
+                    let Some(exit_code) = fields.next().and_then(|value| value.parse::<i32>().ok())
+                    else {
                         continue;
                     };
-                    // Every managed shell invokes its prompt hook once during
-                    // startup. A command may already be queued in the PTY by
-                    // then, so never treat that first prompt as its completion.
+                    let marker_sequence = fields.next().and_then(|value| value.parse::<u64>().ok());
+                    // Consume the startup prompt before command.run registers
+                    // ownership. This prevents a fast command or cancellation
+                    // from being mistaken for the shell's first prompt.
                     if !initial_prompt_seen {
                         initial_prompt_seen = true;
+                        mark_shell_ready(pane_id);
                         continue;
+                    }
+                    // The FIFO can outrun the PTY parser. Wait for the hidden
+                    // prompt marker so output capture and subsequent pane reuse
+                    // observe every byte emitted by the completed command.
+                    if marker_sequence
+                        .is_some_and(|sequence| !wait_for_prompt_marker(pane_id, sequence))
+                    {
+                        log::warn!(
+                            "timed out waiting for managed shell prompt marker in pane {pane_id}"
+                        );
                     }
                     finish_running_command(pane_id, exit_code);
                 }
-            }
-            let _ = fs::remove_dir_all(&cleanup_dir);
-        })
-        .ok();
+                let (ready, _) = &*SHELL_READY;
+                ready.lock().unwrap().remove(&pane_id);
+                let (markers, _) = &*PROMPT_MARKERS;
+                markers.lock().unwrap().remove(&pane_id);
+                let _ = fs::remove_dir_all(&cleanup_dir);
+            })
+            .map_err(|error| anyhow!("start managed shell callback: {error}"))?;
+        anyhow::ensure!(
+            wait_for_shell_ready(pane_id),
+            "managed shell did not reach its initial prompt"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (callback_fifo, cleanup_dir);
+        anyhow::bail!("managed shell callbacks are only supported on Unix");
+    }
 }
 
 #[cfg(unix)]
@@ -1611,12 +1860,7 @@ fn open_callback_fifo(path: &Path) -> anyhow::Result<(std::fs::File, std::fs::Fi
 }
 
 fn finish_running_command(pane_id: PaneId, exit_code: i32) {
-    let command_id = MANAGED_COMMANDS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(_, command)| command.pane_id == pane_id && command.running)
-        .map(|(command_id, _)| command_id.clone());
+    let command_id = MANAGED_PANE_OWNERS.lock().unwrap().get(&pane_id).cloned();
     if let Some(command_id) = command_id {
         finish_command(
             &command_id,
@@ -1635,6 +1879,19 @@ fn finish_command(
     success: Option<bool>,
     reason: Option<&str>,
 ) {
+    let snapshot = {
+        let commands = MANAGED_COMMANDS.lock().unwrap();
+        let Some(command) = commands.get(command_id) else {
+            return;
+        };
+        if !command.running {
+            return;
+        }
+        command.clone()
+    };
+    let (captured_output, output_truncated) =
+        capture_managed_command_output(&snapshot).unwrap_or_else(|_| (String::new(), true));
+
     let (event, owner_client_id) = {
         let mut commands = MANAGED_COMMANDS.lock().unwrap();
         let Some(command) = commands.get_mut(command_id) else {
@@ -1648,15 +1905,8 @@ fn finish_command(
         command.signal = signal;
         command.success = success;
         command.reason = reason.map(str::to_string);
-        let output = pane_text(command.pane_id, None, None)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
+        command.captured_output = Some(captured_output);
+        command.output_truncated = output_truncated;
         (
             json!({
                 "commandId": command_id,
@@ -1664,7 +1914,11 @@ fn finish_command(
                 "signal": command.signal,
                 "success": command.success,
                 "reason": command.reason,
-                "output": output,
+                "outputAvailable": command
+                    .captured_output
+                    .as_ref()
+                    .is_some_and(|output| !output.is_empty()),
+                "outputTruncated": command.output_truncated,
             }),
             command.owner_client_id.clone(),
         )
@@ -1752,5 +2006,50 @@ mod tests {
         assert!(script.contains("'it'\\''s safe'"));
         assert!(!script.contains("PI_WEZTERM_DONE"));
         assert_eq!(script.lines().count(), 1);
+    }
+
+    fn completed_command(pane_id: PaneId, output: &str) -> ManagedCommand {
+        ManagedCommand {
+            pane_id,
+            owner_client_id: None,
+            running: false,
+            exit_code: Some(0),
+            signal: None,
+            success: Some(true),
+            reason: None,
+            output_start_y: 0,
+            output_start_x: 0,
+            captured_output: Some(output.to_string()),
+            output_truncated: false,
+        }
+    }
+
+    #[test]
+    fn completed_command_reads_immutable_output_without_its_pane() {
+        let command = completed_command(usize::MAX - 1, "first\nsecond\nthird");
+        let (output, start, end, truncated) =
+            read_managed_command_output(&command, Some(1), Some(3)).unwrap();
+        assert_eq!(output, "second\nthird");
+        assert_eq!((start, end), (1, 3));
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn stale_command_id_cannot_control_a_reused_pane() {
+        let pane_id = usize::MAX - 2;
+        let stale = completed_command(pane_id, "old output");
+        let current = completed_command(pane_id, "new output");
+        MANAGED_PANE_OWNERS
+            .lock()
+            .unwrap()
+            .insert(pane_id, "command-current".to_string());
+
+        assert!(ensure_command_owns_pane("command-stale", &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("no longer owns"));
+        ensure_command_owns_pane("command-current", &current).unwrap();
+
+        MANAGED_PANE_OWNERS.lock().unwrap().remove(&pane_id);
     }
 }

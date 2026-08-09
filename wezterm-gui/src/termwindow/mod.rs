@@ -2279,6 +2279,7 @@ impl TermWindow {
             window.save_and_then_set_active(tab_idx);
 
             drop(window);
+            self.sync_active_tab_size();
 
             if let Some(pane) = self.get_active_pane_or_overlay() {
                 pane.focus_changed(true);
@@ -3151,7 +3152,7 @@ impl TermWindow {
                 };
                 let new_idx = new_idx as usize % workspaces.len();
                 if let Some(w) = workspaces.get(new_idx) {
-                    front_end().switch_workspace(w);
+                    front_end().switch_workspace(w, false);
                 }
             }
             SwitchToWorkspace { name, spawn } => {
@@ -3161,10 +3162,17 @@ impl TermWindow {
                     .as_ref()
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| mux.generate_workspace_name());
-                let switcher = crate::frontend::WorkspaceSwitcher::new(&name);
-                mux.set_active_workspace(&name);
+                let create_workspace = !mux.workspace_exists(&name);
+                let switcher = crate::frontend::WorkspaceSwitcher::new_with_create(
+                    &name,
+                    create_workspace,
+                );
 
                 if mux.iter_windows_in_workspace(&name).is_empty() {
+                    if !switcher.do_switch() {
+                        drop(activity);
+                        return Ok(PerformAssignmentResult::Handled);
+                    }
                     let spawn = spawn.as_ref().map(|s| s.clone()).unwrap_or_default();
                     let size = self.terminal_size;
                     let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
@@ -3182,12 +3190,12 @@ impl TermWindow {
                         {
                             log::error!("Failed to spawn: {:#}", err);
                         }
-                        switcher.do_switch();
                         drop(activity);
                     })
                     .detach();
                 } else {
-                    switcher.do_switch();
+                    let _ = switcher.do_switch();
+                    drop(activity);
                 }
             }
             DetachDomain(domain) => {
@@ -3703,6 +3711,27 @@ impl TermWindow {
                 }
             }
             panes
+        }
+    }
+
+    /// A tab can retain the geometry from the GUI that last displayed it.
+    /// Synchronize it when it becomes active, rather than resizing every tab
+    /// during every render (which can create a resize feedback loop with a
+    /// remote persistent mux).
+    fn sync_active_tab_size(&self) {
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        let tab_size = tab.get_size();
+        if tab_size != self.terminal_size {
+            log::debug!(
+                "syncing active tab {} from {:?} to native window size {:?}",
+                tab.tab_id(),
+                tab_size,
+                self.terminal_size
+            );
+            tab.resize(self.terminal_size);
         }
     }
 

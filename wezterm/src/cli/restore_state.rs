@@ -84,6 +84,7 @@ impl RestoreStateCommand {
                 .spawn_v2(codec::SpawnV2 {
                     domain: SpawnTabDomain::DefaultDomain,
                     window_id,
+                    create_workspace: false,
                     command: restore_command(&first, config),
                     command_dir: command_dir(&first),
                     size: root_size,

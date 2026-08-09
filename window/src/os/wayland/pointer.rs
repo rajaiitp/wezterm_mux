@@ -117,9 +117,15 @@ impl PendingMouse {
                 false
             }
             PointerEventKind::Leave { .. } => {
-                let changed = self.in_window;
+                let changed = self.in_window || !self.button.is_empty();
                 self.surface_coords = None;
                 self.in_window = false;
+                // A compositor-driven resize can terminate an implicit pointer
+                // grab without delivering the button release to the surface.
+                // Drop queued buttons here; the GUI receives MouseLeave and
+                // resets its capture state instead of keeping a stuck drag.
+                self.button.clear();
+                self.scroll = None;
                 changed
             }
             PointerEventKind::Motion { .. } => {

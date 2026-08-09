@@ -146,6 +146,7 @@ impl crate::TermWindow {
                 line: params.line,
                 palette: params.palette,
                 window_is_transparent: params.window_is_transparent,
+                pane_background_opacity: params.pane_background_opacity,
                 reverse_video: params.dims.reverse_video,
                 shape_key: &params.shape_key,
             };
@@ -222,7 +223,9 @@ impl crate::TermWindow {
                 }
 
                 (
-                    bg.mul_alpha(self.config.text_background_opacity),
+                    bg.mul_alpha(
+                        self.config.text_background_opacity * params.pane_background_opacity,
+                    ),
                     bg_default,
                 )
             };
@@ -842,7 +845,7 @@ impl crate::TermWindow {
                     if params.window_is_transparent && bg_is_default {
                         0.0
                     } else {
-                        params.config.text_background_opacity
+                        params.config.text_background_opacity * params.pane_background_opacity
                     },
                 );
 

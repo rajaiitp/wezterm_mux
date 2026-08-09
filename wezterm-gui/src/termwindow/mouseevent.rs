@@ -254,7 +254,19 @@ impl super::TermWindow {
     }
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
+        // A compositor-driven resize can make Wayland deliver a leave without
+        // a matching button release. Do not retain the old capture/drag state:
+        // otherwise every later click is routed to the stale pane or drag
+        // target, making the tab bar and new-tab button appear dead.
         self.current_mouse_event = None;
+        self.last_mouse_click = None;
+        self.current_mouse_buttons.clear();
+        self.current_mouse_capture = None;
+        self.dragging = None;
+        self.window_drag_position = None;
+        self.drag_start_split = None;
+        self.drag_start_pointer = None;
+        self.is_click_to_focus_window = false;
         self.update_title();
         context.set_cursor(Some(MouseCursor::Arrow));
         context.invalidate();

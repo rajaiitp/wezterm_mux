@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 47;
+pub const CODEC_VERSION: usize = 48;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -503,6 +503,7 @@ pdu! {
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
     GetPaneExitStatus: 63,
+    SetClientWorkspace: 65,
     GetPaneExitStatusResponse: 64,
 }
 
@@ -685,6 +686,9 @@ pub struct SpawnV2 {
     pub domain: config::keyassignment::SpawnTabDomain,
     /// If None, create a new window for this new tab
     pub window_id: Option<WindowId>,
+    /// Atomically reserve a new workspace name before spawning its first pane.
+    #[serde(default)]
+    pub create_workspace: bool,
     pub command: Option<CommandBuilder>,
     pub command_dir: Option<String>,
     pub size: TerminalSize,
@@ -779,6 +783,15 @@ pub struct SetClipboard {
 pub struct SetWindowWorkspace {
     pub window_id: WindowId,
     pub workspace: String,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetClientWorkspace {
+    pub workspace: String,
+    /// When true, the request is creating a new workspace rather than
+    /// switching to an existing one. The mux rejects an existing name.
+    #[serde(default)]
+    pub create: bool,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

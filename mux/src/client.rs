@@ -47,6 +47,15 @@ pub struct ClientInfo {
     pub connected_at: DateTime<Utc>,
     /// Which workspace is active
     pub active_workspace: Option<String>,
+    /// Whether the active workspace is being created by this client. This is
+    /// consumed by the first spawn and prevents two clients racing to create
+    /// the same name.
+    #[serde(default)]
+    pub creating_workspace: bool,
+    /// Last locally accepted workspace, used to roll back a rejected remote
+    /// workspace claim without briefly displaying the rejected workspace.
+    #[serde(default)]
+    pub previous_workspace: Option<String>,
     /// The last time we received input from this client
     #[serde(with = "ts_seconds")]
     pub last_input: DateTime<Utc>,
@@ -60,6 +69,8 @@ impl ClientInfo {
             client_id,
             connected_at: Utc::now(),
             active_workspace: None,
+            creating_workspace: false,
+            previous_workspace: None,
             last_input: Utc::now(),
             focused_pane_id: None,
         }

@@ -52,6 +52,25 @@ pub mod window;
 use crate::activity::Activity;
 
 pub const DEFAULT_WORKSPACE: &str = "default";
+/// GUI-only bystander workspaces used while attaching a second view.
+/// They must never be included in persistent session snapshots.
+pub const TEMP_WORKSPACE_PREFIX: &str = "WEZ_#";
+
+pub fn is_ephemeral_workspace(name: &str) -> bool {
+    if name.starts_with(TEMP_WORKSPACE_PREFIX) {
+        return true;
+    }
+
+    // Compatibility with the previous `workspace-view-<pid>` naming scheme.
+    name.rsplit_once("-view-")
+        .map(|(_, suffix)| {
+            !suffix.is_empty()
+                && suffix
+                    .split('-')
+                    .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .unwrap_or(false)
+}
 
 #[derive(Clone, Debug)]
 pub enum MuxNotification {
@@ -623,11 +642,24 @@ impl Mux {
         names
     }
 
-    /// Generate a new unique workspace name
+    /// Returns whether a workspace name is already present in the mux or is
+    /// currently selected by a connected client. The latter matters during
+    /// startup: a workspace can be claimed before its first pane/window has
+    /// arrived from a remote domain.
+    pub fn workspace_exists(&self, workspace: &str) -> bool {
+        self.windows
+            .read()
+            .values()
+            .any(|window| window.get_workspace() == workspace)
+            || self.clients.read().values().any(|client| {
+                client.active_workspace.as_deref() == Some(workspace)
+            })
+    }
+
+    /// Generate a new unique workspace name.
     pub fn generate_workspace_name(&self) -> String {
-        let used = self.iter_workspaces();
         for candidate in names::Generator::default() {
-            if !used.contains(&candidate) {
+            if !self.workspace_exists(&candidate) {
                 return candidate;
             }
         }
@@ -658,11 +690,132 @@ impl Mux {
     }
 
     pub fn set_active_workspace_for_client(&self, ident: &Arc<ClientId>, workspace: &str) {
+        self.set_active_workspace_for_client_with_create(ident, workspace, false);
+    }
+
+    pub fn set_active_workspace_for_client_with_create(
+        &self,
+        ident: &Arc<ClientId>,
+        workspace: &str,
+        create: bool,
+    ) {
         let mut clients = self.clients.write();
-        if let Some(info) = clients.get_mut(&ident) {
+        let changed = if let Some(info) = clients.get_mut(&ident) {
+            if info.active_workspace.as_deref() != Some(workspace) {
+                info.previous_workspace = info.active_workspace.clone();
+            }
             info.active_workspace.replace(workspace.to_string());
+            info.creating_workspace = create;
+            true
+        } else {
+            false
+        };
+        drop(clients);
+        if changed {
             self.notify(MuxNotification::ActiveWorkspaceChanged(ident.clone()));
         }
+    }
+
+    pub fn workspace_is_being_created_for_client(&self, ident: &Arc<ClientId>) -> bool {
+        self.clients
+            .read()
+            .get(ident)
+            .is_some_and(|info| info.creating_workspace)
+    }
+
+    /// Restore the last locally accepted workspace after the server rejects a
+    /// claim. This is intentionally a mux operation so every client/domain
+    /// implementation gets the same rollback semantics.
+    pub fn restore_previous_workspace_for_client(&self, ident: &Arc<ClientId>) {
+        let mut clients = self.clients.write();
+        let changed = if let Some(info) = clients.get_mut(&ident) {
+            let previous = info.previous_workspace.take().or_else(|| {
+                Some(self.get_default_workspace())
+            });
+            if let Some(previous) = previous {
+                info.active_workspace.replace(previous);
+                info.creating_workspace = false;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        drop(clients);
+        if changed {
+            self.notify(MuxNotification::ActiveWorkspaceChanged(ident.clone()));
+        }
+    }
+
+    /// Atomically reserve a name for a new workspace. The reservation is held
+    /// in the client's active-workspace record until the first spawn consumes
+    /// it, so two clients cannot both create the same name during the startup
+    /// window before the first pane is visible.
+    pub fn create_workspace_for_client(
+        &self,
+        ident: &Arc<ClientId>,
+        workspace: &str,
+    ) -> anyhow::Result<()> {
+        if workspace.is_empty() {
+            anyhow::bail!("workspace names cannot be empty");
+        }
+        let windows = self.windows.read();
+        if windows
+            .values()
+            .any(|window| window.get_workspace() == workspace)
+        {
+            anyhow::bail!("workspace {workspace} already exists");
+        }
+        let mut clients = self.clients.write();
+        if clients
+            .values()
+            .any(|info| info.active_workspace.as_deref() == Some(workspace))
+        {
+            anyhow::bail!("workspace {workspace} is already reserved or owned");
+        }
+        let info = clients
+            .get_mut(ident)
+            .ok_or_else(|| anyhow::anyhow!("client is not registered"))?;
+        if info.active_workspace.as_deref() != Some(workspace) {
+            info.previous_workspace = info.active_workspace.clone();
+        }
+        info.active_workspace.replace(workspace.to_string());
+        info.creating_workspace = true;
+        let ident = ident.clone();
+        drop(clients);
+        drop(windows);
+        self.notify(MuxNotification::ActiveWorkspaceChanged(ident));
+        Ok(())
+    }
+
+    /// Atomically claims a workspace for a connected GUI client. This is the
+    /// mux ownership boundary: every protocol client must pass through here,
+    /// so direct CLI/automation callers cannot bypass workspace exclusivity.
+    pub fn claim_workspace_for_client(
+        &self,
+        ident: &Arc<ClientId>,
+        workspace: &str,
+    ) -> anyhow::Result<()> {
+        let mut clients = self.clients.write();
+        if clients.values().any(|info| {
+            info.client_id.as_ref() != ident.as_ref()
+                && info.active_workspace.as_deref() == Some(workspace)
+        }) {
+            anyhow::bail!("workspace {workspace} is already owned by another client");
+        }
+        let info = clients
+            .get_mut(ident)
+            .ok_or_else(|| anyhow::anyhow!("client is not registered"))?;
+        if info.active_workspace.as_deref() != Some(workspace) {
+            info.previous_workspace = info.active_workspace.clone();
+        }
+        info.active_workspace.replace(workspace.to_string());
+        info.creating_workspace = false;
+        let ident = ident.clone();
+        drop(clients);
+        self.notify(MuxNotification::ActiveWorkspaceChanged(ident));
+        Ok(())
     }
 
     /// Assigns the active workspace name for the current identity
@@ -672,9 +825,22 @@ impl Mux {
         }
     }
 
-    pub fn rename_workspace(&self, old_workspace: &str, new_workspace: &str) {
+    pub fn rename_workspace(
+        &self,
+        old_workspace: &str,
+        new_workspace: &str,
+    ) -> anyhow::Result<()> {
+        if old_workspace.is_empty() || new_workspace.is_empty() {
+            anyhow::bail!("workspace names cannot be empty");
+        }
         if old_workspace == new_workspace {
-            return;
+            return Ok(());
+        }
+        if !self.workspace_exists(old_workspace) {
+            anyhow::bail!("workspace {old_workspace} does not exist");
+        }
+        if self.workspace_exists(new_workspace) {
+            anyhow::bail!("workspace {new_workspace} already exists");
         }
         self.notify(MuxNotification::WorkspaceRenamed {
             old_workspace: old_workspace.to_string(),
@@ -695,6 +861,7 @@ impl Mux {
                 ));
             }
         }
+        Ok(())
     }
 
     /// Overrides the current client identity.

@@ -601,6 +601,18 @@ pub struct Config {
     #[dynamic(default = "default_one_point_oh")]
     pub window_background_opacity: f32,
 
+    /// Specifies the opacity of the active pane background.
+    /// The default is 1.0. Values below 1.0 allow the compositor background
+    /// to show through the active pane background.
+    #[dynamic(default = "default_one_point_oh")]
+    pub active_pane_opacity: f32,
+
+    /// Specifies the opacity of inactive pane backgrounds.
+    /// The default is 1.0. Values below 1.0 allow the compositor background
+    /// to show through inactive pane backgrounds.
+    #[dynamic(default = "default_one_point_oh")]
+    pub inactive_pane_opacity: f32,
+
     /// inactive_pane_hue, inactive_pane_saturation and
     /// inactive_pane_brightness allow for transforming the color
     /// of inactive panes.

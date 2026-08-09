@@ -19,14 +19,24 @@ new panes.
 ## Tools
 
 The extension exposes a small command interface: `terminal_run`,
-`terminal_read`, `terminal_command`, and `terminal_input`. Pi sees only opaque
-command IDs and command output; pane, tab, and window identity stays inside the
-mux plugin. Each Pi pane owns a fixed pool of up to three visible command
-panes: one side panel, then stacked panes within it. Commands reuse idle shell
-panes instead of opening or closing panes repeatedly. Completion is an event
-callback, not a polling loop; panes remain visible, readable, and interactive.
-The extension does not inject a full mux/topology snapshot into Pi context. All
-`terminal_input` writes keyboard-style bytes directly rather than using
-bracketed paste, so a trailing `\n` submits a prompt response and control bytes
-such as Ctrl-C take effect. All operations use the native typed JSON-RPC socket;
-no `wezterm cli` subprocesses or screen scraping are used.
+`terminal_read`, `terminal_command`, and `terminal_input`. Pi receives an
+opaque command ID plus a concise `$ ...` display line showing the exact
+argv/cwd that was started; pane, tab, window, and pool identity stay inside the
+mux plugin.
+Each Pi pane owns a fixed pool of up to three visible command panes: one side
+panel, then stacked panes within it. Commands reuse idle shells instead of
+opening or closing panes repeatedly, while each command ID retains its own
+immutable output and status. A stale command ID can still read its captured
+output but cannot input to, cancel, or close a pane that has since been reused.
+
+Completion is a compact `command.finished` callback, not a polling loop. The
+callback reports status only; Pi calls `terminal_read` when that command's
+output is relevant. A long-lived interactive program such as SSH keeps its pane
+ownership until it exits, so repeated `terminal_input` calls continue to reach
+the same session. `terminal_input` writes keyboard-style bytes directly rather
+than using bracketed paste: a trailing `\n` submits a line and control bytes
+such as Ctrl-C take effect.
+
+The extension does not inject a mux/topology snapshot into Pi context. All
+operations use the native typed JSON-RPC socket; no `wezterm cli` subprocesses
+or screen scraping are used.

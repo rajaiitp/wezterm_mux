@@ -88,6 +88,7 @@ pub struct LineToElementParams<'a> {
     pub config: &'a ConfigHandle,
     pub palette: &'a ColorPalette,
     pub window_is_transparent: bool,
+    pub pane_background_opacity: f32,
     pub reverse_video: bool,
     pub shape_key: &'a Option<LineToEleShapeCacheKey>,
 }
@@ -97,6 +98,7 @@ pub struct LineToEleShapeCacheKey {
     pub shape_hash: [u8; 16],
     pub composing: Option<(usize, String)>,
     pub shape_generation: usize,
+    pub pane_background_opacity: NotNan<f32>,
 }
 
 pub struct LineToElementShapeItem {
@@ -154,6 +156,8 @@ pub struct RenderScreenLineParams<'a> {
     pub cursor_is_default_color: bool,
 
     pub window_is_transparent: bool,
+    /// Opacity applied to pane backgrounds while leaving foreground text opaque.
+    pub pane_background_opacity: f32,
     pub default_bg: LinearRgba,
 
     /// Override font resolution; useful together with

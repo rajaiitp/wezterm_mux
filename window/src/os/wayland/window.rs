@@ -822,6 +822,10 @@ impl WaylandWindowInner {
         }
 
         if !PendingMouse::in_window(&pending_mouse) {
+            // A resize can interrupt a pointer grab and lose the release
+            // event. Reset the native button state together with the GUI
+            // capture state so the next click is not treated as a drag.
+            self.mouse_buttons = MouseButtons::NONE;
             self.events.dispatch(WindowEvent::MouseLeave);
             self.refresh_frame();
         }
@@ -936,9 +940,13 @@ impl WaylandWindowInner {
                     self.events.dispatch(WindowEvent::Resized {
                         dimensions: self.dimensions,
                         window_state: self.window_state,
-                        // We don't know if we're live resizing or not, so
-                        // assume no.
-                        live_resizing: false,
+                        // Wayland sends a stream of configure events while
+                        // the compositor is interactively resizing a window.
+                        // Treat these like live-resize events so the GUI does
+                        // not repeatedly run the expensive DPI/scaling path
+                        // or flood the mux with redundant geometry work. DPI
+                        // changes still take the full scaling path.
+                        live_resizing: true,
                     });
                     // Avoid blurring by matching the scaling factor of the
                     // compositor; if it is going to double the size then

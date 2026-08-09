@@ -14,6 +14,7 @@ use mux::{Mux, MuxNotification};
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use wezterm_term::TerminalSize;
 
@@ -26,6 +27,11 @@ pub struct ClientInner {
     remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    // TabResized notifications can arrive once per Wayland configure event.
+    // Coalesce them so a live resize cannot queue an unbounded list_panes
+    // resync workload on the GUI main thread and persistent mux.
+    pub(crate) tab_resync_generation: AtomicU64,
+    pub(crate) tab_resync_running: AtomicBool,
 }
 
 impl ClientInner {
@@ -246,6 +252,33 @@ impl ClientInner {
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
+            tab_resync_generation: AtomicU64::new(0),
+            tab_resync_running: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn request_tab_resync(&self) -> bool {
+        self.tab_resync_generation.fetch_add(1, Ordering::AcqRel);
+        !self.tab_resync_running.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn tab_resync_generation(&self) -> u64 {
+        self.tab_resync_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn finish_tab_resync(&self, generation: u64) -> bool {
+        if self.tab_resync_generation() != generation {
+            return true;
+        }
+
+        self.tab_resync_running.store(false, Ordering::Release);
+        if self.tab_resync_generation() != generation {
+            // A notification arrived while ownership was being released;
+            // retain ownership and run one trailing resync.
+            self.tab_resync_running.swap(true, Ordering::AcqRel);
+            true
+        } else {
+            false
         }
     }
 }
@@ -278,8 +311,30 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
     };
 
     match notif {
-        MuxNotification::ActiveWorkspaceChanged(_client_id) => {
-            // TODO: advice remote host of interesting workspaces
+        MuxNotification::ActiveWorkspaceChanged(client_id) => {
+            if let Some(inner) = client_domain.inner() {
+                let workspace = mux.active_workspace_for_client(&client_id);
+                let create = mux.workspace_is_being_created_for_client(&client_id);
+                if !create {
+                    promise::spawn::spawn(async move {
+                        if let Err(err) = inner
+                            .client
+                            .set_client_workspace(codec::SetClientWorkspace {
+                                workspace,
+                                create: false,
+                            })
+                            .await
+                        {
+                            log::warn!("remote workspace ownership rejected: {err:#}");
+                            promise::spawn::spawn_into_main_thread(async move {
+                                Mux::get().restore_previous_workspace_for_client(&client_id);
+                            })
+                            .detach();
+                        }
+                    })
+                    .detach();
+                }
+            }
         }
         MuxNotification::WorkspaceRenamed {
             old_workspace,
@@ -289,13 +344,27 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
                 let workspaces = Mux::get().iter_workspaces();
                 if workspaces.contains(&old_workspace) {
                     promise::spawn::spawn(async move {
-                        inner
+                        let result = inner
                             .client
                             .rename_workspace(codec::RenameWorkspace {
-                                old_workspace,
-                                new_workspace,
+                                old_workspace: old_workspace.clone(),
+                                new_workspace: new_workspace.clone(),
                             })
-                            .await
+                            .await;
+                        if let Err(err) = result {
+                            log::warn!("remote workspace rename rejected: {err:#}");
+                            promise::spawn::spawn_into_main_thread(async move {
+                                let mux = Mux::get();
+                                if let Err(rollback_err) =
+                                    mux.rename_workspace(&new_workspace, &old_workspace)
+                                {
+                                    log::error!(
+                                        "failed to roll back rejected workspace rename: {rollback_err:#}"
+                                    );
+                                }
+                            })
+                            .detach();
+                        }
                     })
                     .detach();
                 }
@@ -750,7 +819,24 @@ impl ClientDomain {
         ));
         *domain.inner.lock().unwrap() = Some(Arc::clone(&inner));
 
-        Self::process_pane_list(inner, panes, primary_window_id)?;
+        Self::process_pane_list(Arc::clone(&inner), panes, primary_window_id)?;
+
+        // Claim the workspace selected before the remote attach completed.
+        // This closes the startup race without relying on Lua/config hooks.
+        let workspace = mux.active_workspace();
+        promise::spawn::spawn(async move {
+            if let Err(err) = inner
+                .client
+                .set_client_workspace(codec::SetClientWorkspace {
+                    workspace,
+                    create: false,
+                })
+                .await
+            {
+                log::warn!("remote workspace ownership rejected during attach: {err:#}");
+            }
+        })
+        .detach();
 
         Ok(())
     }
@@ -844,19 +930,41 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let workspace = Mux::get().active_workspace();
+        let mux = Mux::get();
+        let workspace = mux.active_workspace();
+        let create_workspace = mux
+            .active_identity()
+            .is_some_and(|ident| mux.workspace_is_being_created_for_client(&ident));
 
-        let result = inner
+        let result = match inner
             .client
             .spawn_v2(SpawnV2 {
                 domain: SpawnTabDomain::DefaultDomain,
                 window_id: inner.local_to_remote_window(window),
+                create_workspace,
                 size,
                 command,
                 command_dir,
-                workspace,
+                workspace: workspace.clone(),
             })
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                if create_workspace {
+                    if let Some(ident) = mux.active_identity() {
+                        mux.restore_previous_workspace_for_client(&ident);
+                    }
+                }
+                return Err(err);
+            }
+        };
+
+        if create_workspace {
+            if let Some(ident) = mux.active_identity() {
+                mux.set_active_workspace_for_client(&ident, &workspace);
+            }
+        }
 
         inner.record_remote_to_local_window_mapping(result.window_id, window);
 

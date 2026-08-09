@@ -4,15 +4,35 @@
 import { Type } from "typebox";
 import { AutomationClient } from "./protocol.ts";
 
-const SOCKET = process.env.WEZTERM_AUTOMATION_SOCKET;
+const TERM_PROGRAM = process.env.TERM_PROGRAM ?? "";
+// TERM_PROGRAM is authoritative here. Kitty variables can be inherited by a
+// WezTerm pane, so do not reject WezTerm merely because KITTY_* is present.
+const IS_WEZTERM = TERM_PROGRAM === "WezTerm";
+const MUX_SOCKET = process.env.WEZTERM_UNIX_SOCKET;
+const SOCKET = process.env.WEZTERM_AUTOMATION_SOCKET
+  ?? (MUX_SOCKET ? `${MUX_SOCKET}.automation` : undefined);
 const PANE_ID = Number.parseInt(process.env.WEZTERM_PANE ?? "", 10);
 const EXTENSION_ID = "pi-wezterm";
 
 export default function (pi) {
-  if (!SOCKET || !Number.isFinite(PANE_ID)) return;
+  // Pi discovers extensions globally. Do not register any tools or lifecycle
+  // handlers in Kitty (or another terminal), even if stale WEZTERM_* variables
+  // happen to be inherited by the process.
+  if (!IS_WEZTERM || !SOCKET || !Number.isFinite(PANE_ID)) return;
 
   let client;
     let ctxRef;
+    const activeCommands = new Map();
+
+    const shellQuote = (value) => {
+      const text = String(value);
+      return text === "" ? "''" : `'${text.replace(/'/g, "'\\''")}'`;
+    };
+
+    const displayCommand = (argv, cwd) => {
+      const command = argv.map(shellQuote).join(" ");
+      return cwd ? `cd -- ${shellQuote(cwd)} && ${command}` : command;
+    };
 
     const notify = (message, level = "info") => {
       try {
@@ -56,9 +76,12 @@ export default function (pi) {
           const status = success
             ? "succeeded"
             : `exited (${data.exitCode ?? data.signal ?? "unknown"})`;
-          const output = typeof data.output === "string" ? data.output : "";
-          const trigger = `[terminal command finished] ${commandId} ${status}\n${output}`;
+          const commandText = activeCommands.get(commandId);
+          const trigger = commandText
+            ? `[terminal command finished] ${commandId} ${status}\n$ ${commandText}`
+            : `[terminal command finished] ${commandId} ${status}`;
 
+          activeCommands.delete(commandId);
           notify(`Terminal ${commandId} ${status}`, success ? "info" : "warning");
           // The command ID is the only orchestration handle exposed to Pi;
           // pane/window/tab identity stays inside the mux plugin.
@@ -67,17 +90,31 @@ export default function (pi) {
       });
 
       client = nextClient;
-      try {
-        await nextClient.connect();
-        return nextClient;
-      } catch (error) {
-        notify(`WezTerm unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
-        if (client === nextClient) {
-          nextClient.disconnect();
-          client = undefined;
+      let lastError;
+      // The mux starts the automation listener asynchronously. Retry transient
+      // startup/restart races here instead of surfacing a misleading
+      // "connection refused" error on the first Pi tool call.
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        client = nextClient;
+        try {
+          await nextClient.connect();
+          return nextClient;
+        } catch (error) {
+          lastError = error;
+          if (client === nextClient) {
+            nextClient.disconnect();
+            client = undefined;
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          if (!/connection refused|connect|unavailable|closed/i.test(message)) break;
+          await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
         }
-        return undefined;
       }
+      notify(
+        `WezTerm unavailable after retrying: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+        "warning",
+      );
+      return undefined;
     };
 
     const call = async (method, params, signal, ctx) => {
@@ -96,7 +133,7 @@ export default function (pi) {
       name: "terminal_run",
       label: "Run Terminal Command",
       description:
-        "Start a visible command asynchronously in Pi's managed terminal pool and return its opaque command ID. Pass argv directly; use [\"bash\", \"-lc\", SCRIPT] for shell syntax. Never sleep or poll for completion: a command.finished follow-up arrives automatically with status and output.",
+        "Start a visible command asynchronously and show the exact command plus its opaque command ID. Pass argv directly; use [\"bash\", \"-lc\", SCRIPT] for shell syntax. Never sleep or poll for completion: command.finished arrives automatically.",
       parameters: Type.Object({
         command: Type.Array(Type.String()),
         cwd: Type.Optional(Type.String()),
@@ -107,7 +144,20 @@ export default function (pi) {
           paneId: PANE_ID,
           cwd: params.cwd,
         }, signal, ctx);
-        return result({ commandId: command.commandId, running: true });
+        const commandText = displayCommand(params.command, params.cwd);
+        activeCommands.set(command.commandId, commandText);
+        return {
+          content: [{
+            type: "text",
+            text: `[terminal command started] ${command.commandId}\n$ ${commandText}`,
+          }],
+          details: {
+            commandId: command.commandId,
+            command: params.command,
+            cwd: params.cwd,
+            running: true,
+          },
+        };
       },
     });
 
@@ -115,11 +165,11 @@ export default function (pi) {
       name: "terminal_read",
       label: "Read Terminal Output",
       description:
-        "Read a command's retained output buffer, optionally by range. Use this for output needed while a command is still running or for later inspection; do not repeatedly call it to detect completion because command.finished is delivered automatically.",
+        "Read output captured only for the specified command, even after its pane is reused. Optional start/end values are zero-based line offsets within that command's output. Read only when the output is relevant; command.finished reports completion automatically.",
       parameters: Type.Object({
         commandId: Type.String(),
-        start: Type.Optional(Type.Integer()),
-        end: Type.Optional(Type.Integer()),
+        start: Type.Optional(Type.Integer({ description: "First command-output line to include." })),
+        end: Type.Optional(Type.Integer({ description: "Exclusive command-output line boundary." })),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         const response = await call("command.read", {
@@ -127,7 +177,10 @@ export default function (pi) {
           start: params.start,
           end: params.end,
         }, signal, ctx);
-        return result(response.output ?? "");
+        return {
+          content: [{ type: "text", text: response.output ?? "" }],
+          details: response,
+        };
       },
     });
 
@@ -178,10 +231,11 @@ export default function (pi) {
       },
     });
 
-    pi.on("session_start", async (_event, ctx) => {
-      ctxRef = ctx;
-      await connect(ctx);
-    });
+  pi.on("session_start", (_event, ctx) => {
+    // Connect lazily on the first tool call. The persistent mux/automation
+    // listener may still be starting when Pi loads its extensions.
+    ctxRef = ctx;
+  });
 
   pi.on("session_shutdown", () => {
     ctxRef = undefined;

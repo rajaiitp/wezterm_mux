@@ -12,7 +12,7 @@ use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
-use mux::Mux;
+use mux::{is_ephemeral_workspace, Mux};
 use mux_lua::MuxDomain;
 use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
@@ -58,6 +58,7 @@ mod unicode_names;
 mod uniforms;
 mod update;
 mod utilsprites;
+mod workspace;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -289,6 +290,13 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     workspace: Option<String>,
 ) -> anyhow::Result<()> {
     let mux = Mux::get();
+    // If GUI ownership moved this client into a temporary bystander before
+    // attach, scope the initial spawn check to that workspace. Otherwise the
+    // presence of panes in another workspace would leave the bystander empty.
+    let workspace = workspace.or_else(|| {
+        let active = mux.active_workspace();
+        is_ephemeral_workspace(&active).then_some(active)
+    });
 
     let domain = domain.unwrap_or_else(|| mux.default_domain());
 
@@ -395,6 +403,15 @@ async fn trigger_and_log_gui_attached(domain: MuxDomain) {
         log::error!("{}", message);
         persistent_toast_notification("Error", &message);
     }
+    // Attaching a remote domain can create local windows for every remote
+    // workspace before ownership arbitration completes. Reconcile once after
+    // the attach event so a denied workspace never remains as a second GUI
+    // window beside the owned workspace.
+    let reconcile = crate::frontend::front_end().reconcile_workspace();
+    promise::spawn::spawn_into_main_thread(async move {
+        let _ = reconcile.await;
+    })
+    .detach();
 }
 
 fn cell_pixel_dims(config: &ConfigHandle, dpi: f64) -> anyhow::Result<(usize, usize)> {
@@ -631,6 +648,7 @@ impl Publish {
                             .spawn_v2(codec::SpawnV2 {
                                 domain,
                                 window_id,
+                                create_workspace: false,
                                 command,
                                 command_dir: None,
                                 size: config.initial_size(0, None),

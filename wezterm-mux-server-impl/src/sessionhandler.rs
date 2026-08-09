@@ -276,14 +276,39 @@ impl SessionHandler {
 
         match decoded.pdu {
             Pdu::Ping(Ping {}) => send_response(Ok(Pdu::Pong(Pong {}))),
+            Pdu::SetClientWorkspace(SetClientWorkspace { workspace, create }) => {
+                let client_id = self.client_id.clone();
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let client_id = client_id
+                                .as_ref()
+                                .ok_or_else(|| anyhow!("client identity is not registered"))?;
+                            if create {
+                                Mux::get().create_workspace_for_client(client_id, &workspace)?;
+                            } else {
+                                Mux::get().claim_workspace_for_client(client_id, &workspace)?;
+                            }
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
             Pdu::SetWindowWorkspace(SetWindowWorkspace {
                 window_id,
                 workspace,
             }) => {
+                let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             let mux = Mux::get();
+                            let client_id = client_id
+                                .as_ref()
+                                .ok_or_else(|| anyhow!("client identity is not registered"))?;
+                            mux.claim_workspace_for_client(client_id, &workspace)?;
                             let mut window = mux
                                 .get_window_mut(window_id)
                                 .ok_or_else(|| anyhow!("window {} is invalid", window_id))?;
@@ -320,11 +345,11 @@ impl SessionHandler {
 
                     let client_id = Arc::new(client_id);
                     self.client_id.replace(client_id.clone());
-                    spawn_into_main_thread(async move {
-                        let mux = Mux::get();
-                        mux.register_client(client_id);
-                    })
-                    .detach();
+                    // Register synchronously before acknowledging SetClientId.
+                    // The next PDU may be the first workspace/spawn request;
+                    // queueing registration on the main thread created a race
+                    // where that request saw an unregistered client.
+                    Mux::get().register_client(client_id);
                 }
                 send_response(Ok(Pdu::UnitResponse(UnitResponse {})))
             }
@@ -427,7 +452,7 @@ impl SessionHandler {
                     catch(
                         move || {
                             let mux = Mux::get();
-                            mux.rename_workspace(&old_workspace, &new_workspace);
+                            mux.rename_workspace(&old_workspace, &new_workspace)?;
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
@@ -1114,7 +1139,25 @@ async fn split_pane(split: SplitPane, client_id: Option<Arc<ClientId>>) -> anyho
 
 async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> anyhow::Result<Pdu> {
     let mux = Mux::get();
-    let _identity = mux.with_identity(client_id);
+    let _identity = mux.with_identity(client_id.clone());
+    let client_id = client_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("client identity is not registered"))?;
+    let workspace = spawn.workspace.clone();
+    let create_workspace = spawn.create_workspace;
+    if create_workspace {
+        anyhow::ensure!(
+            spawn.window_id.is_none(),
+            "creating a workspace requires a new window"
+        );
+        let already_reserved = mux.active_workspace_for_client(client_id) == workspace
+            && mux.workspace_is_being_created_for_client(client_id);
+        if !already_reserved {
+            mux.create_workspace_for_client(client_id, &workspace)?;
+        }
+    } else {
+        mux.claim_workspace_for_client(client_id, &spawn.workspace)?;
+    }
 
     let (tab, pane, window_id) = mux
         .spawn_tab_or_window(
@@ -1124,10 +1167,16 @@ async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> an
             spawn.command_dir,
             spawn.size,
             None, // optional current pane_id
-            spawn.workspace,
+            workspace.clone(),
             None, // optional gui window position
         )
         .await?;
+
+    // The first successful spawn materializes the reserved workspace and
+    // clears its creation marker.
+    if create_workspace {
+        mux.claim_workspace_for_client(client_id, &workspace)?;
+    }
 
     Ok::<Pdu, anyhow::Error>(Pdu::SpawnResponse(SpawnResponse {
         pane_id: pane.pane_id(),
@@ -1153,7 +1202,13 @@ async fn move_pane(
     client_id: Option<Arc<ClientId>>,
 ) -> anyhow::Result<Pdu> {
     let mux = Mux::get();
-    let _identity = mux.with_identity(client_id);
+    let _identity = mux.with_identity(client_id.clone());
+    if let Some(workspace) = request.workspace_for_new_window.as_deref() {
+        let client_id = client_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("client identity is not registered"))?;
+        mux.claim_workspace_for_client(client_id, workspace)?;
+    }
 
     let (tab, window_id) = mux
         .move_pane_to_new_tab(

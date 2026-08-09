@@ -506,11 +506,14 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
 }
 
 fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
+    // Empty/partially restored tabs can transiently report a zero dimension
+    // while dead panes are being pruned. Keep cleanup paths total instead of
+    // panicking in the mux server on a divide-by-zero.
     TerminalSize {
         rows: 1,
         cols: 1,
-        pixel_width: size.pixel_width / size.cols,
-        pixel_height: size.pixel_height / size.rows,
+        pixel_width: size.pixel_width.checked_div(size.cols).unwrap_or(0),
+        pixel_height: size.pixel_height.checked_div(size.rows).unwrap_or(0),
         dpi: size.dpi,
     }
 }
@@ -1148,6 +1151,16 @@ impl TabInner {
     fn resize(&mut self, size: TerminalSize) {
         if size.rows == 0 || size.cols == 0 {
             // Ignore "impossible" resize requests
+            return;
+        }
+
+        // Resizes are propagated as TabResized notifications. Avoid doing
+        // the split/pane work and emitting another notification when a
+        // client is merely reconciling a geometry it already has. This is
+        // especially important during Wayland live-resize streams, where
+        // multiple GUI clients can otherwise turn one configure into a
+        // resize/resync feedback storm.
+        if self.size == size {
             return;
         }
 
@@ -2285,6 +2298,20 @@ impl Into<String> for SerdeUrl {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn cell_dimensions_accepts_zero_sized_tabs() {
+        let size = TerminalSize {
+            rows: 0,
+            cols: 0,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 96,
+        };
+        let dimensions = cell_dimensions(&size);
+        assert_eq!(dimensions.pixel_width, 0);
+        assert_eq!(dimensions.pixel_height, 0);
+    }
     use crate::renderable::*;
     use parking_lot::{MappedMutexGuard, Mutex};
     use rangeset::RangeSet;

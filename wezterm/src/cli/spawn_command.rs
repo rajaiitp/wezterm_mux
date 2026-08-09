@@ -104,6 +104,7 @@ impl SpawnCommand {
                         SpawnTabDomain::DomainName(name)
                     }),
                 window_id,
+                create_workspace: false,
                 command: if self.prog.is_empty() {
                     None
                 } else {

@@ -220,6 +220,10 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
             .as_deref()
             .unwrap_or(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS),
     )?;
+    // The mux server now enforces workspace ownership per protocol client.
+    // Register CLI clients before restore/spawn operations so those operations
+    // participate in the same ownership boundary as GUI clients.
+    client.verify_version_compat(&ui).await?;
 
     match cli.sub {
         CliSubCommand::ListClients(cmd) => cmd.run(client).await,

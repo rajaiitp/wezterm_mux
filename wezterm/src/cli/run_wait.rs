@@ -85,6 +85,7 @@ impl RunWaitCommand {
                         SpawnTabDomain::DomainName(name)
                     }),
                 window_id,
+                create_workspace: false,
                 command: Some(CommandBuilder::from_argv(self.prog)),
                 command_dir: resolve_relative_cwd(self.cwd)?,
                 size: config.initial_size(0, None),

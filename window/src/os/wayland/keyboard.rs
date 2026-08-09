@@ -1,4 +1,4 @@
-use std::borrow::BorrowMut;
+use std::borrow::{Borrow, BorrowMut};
 
 use wayland_client::protocol::wl_keyboard::{Event as WlKeyboardEvent, KeymapFormat, WlKeyboard};
 use wayland_client::{Dispatch, Proxy};
@@ -21,6 +21,7 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
         _qhandle: &wayland_client::QueueHandle<WaylandState>,
     ) {
         log::trace!("We reached an event here: {:?}???", event);
+        let is_leave = matches!(&event, WlKeyboardEvent::Leave { .. });
         match &event {
             WlKeyboardEvent::Enter {
                 serial, surface, ..
@@ -38,6 +39,9 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                         text_input.advise_surface(surface, keyboard);
                     }
                 } else {
+                    // Do not leave keyboard input routed to the previous
+                    // surface if the compositor reports an unknown surface.
+                    *state.keyboard_window_id.borrow_mut() = None;
                     log::warn!("{:?}, no known surface", event);
                 }
             }
@@ -102,16 +106,26 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
             }
         }
 
-        let Some(&window_id) = state.keyboard_window_id.as_ref() else {
+        let Some(window_id) = state.keyboard_window_id.borrow().as_ref().copied() else {
             return;
         };
         let Some(win) = state.window_by_id(window_id) else {
+            *state.keyboard_window_id.borrow_mut() = None;
             return;
         };
-        let mut inner = win.as_ref().borrow_mut();
-        let mapper = state.keyboard_mapper.borrow_mut();
-        let mapper = mapper.as_mut().expect("no keymap");
-        inner.keyboard_event(mapper, event);
+        {
+            let mut inner = win.as_ref().borrow_mut();
+            let mapper = state.keyboard_mapper.borrow_mut();
+            let mapper = mapper.as_mut().expect("no keymap");
+            inner.keyboard_event(mapper, event);
+        }
+
+        // A leave must stop routing later key events to the old surface. This
+        // matters after compositor-driven resizes, where a leave can be
+        // delivered without an immediate matching enter event.
+        if is_leave && state.keyboard_window_id.borrow().as_ref() == Some(&window_id) {
+            *state.keyboard_window_id.borrow_mut() = None;
+        }
     }
 }
 
