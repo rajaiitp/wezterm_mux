@@ -1,7 +1,6 @@
 use crate::scripting::guiwin::GuiWin;
 use crate::spawn::SpawnWhere;
 use crate::termwindow::TermWindowNotif;
-use crate::workspace::WorkspaceLeases;
 use crate::TermWindow;
 use ::window::*;
 use anyhow::{Context, Error};
@@ -9,7 +8,7 @@ use config::keyassignment::{KeyAssignment, SpawnCommand};
 use config::{ConfigSubscription, NotificationHandling};
 use mux::client::ClientId;
 use mux::window::WindowId as MuxWindowId;
-use mux::{is_ephemeral_workspace, Mux, MuxNotification};
+use mux::{Mux, MuxNotification};
 use promise::{Future, Promise};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
@@ -34,7 +33,6 @@ pub struct GuiFrontEnd {
     spawned_mux_window: RefCell<HashSet<MuxWindowId>>,
     known_windows: RefCell<BTreeMap<Window, MuxWindowId>>,
     client_id: Arc<ClientId>,
-    workspace_leases: RefCell<WorkspaceLeases>,
     config_subscription: RefCell<Option<ConfigSubscription>>,
 }
 
@@ -51,21 +49,6 @@ impl GuiFrontEnd {
 
         let mux = Mux::get();
         let client_id = mux.active_identity().expect("to have set my own id");
-        let mut workspace_leases = WorkspaceLeases::new()?;
-        let active_workspace = mux.active_workspace();
-        if !workspace_leases.claim(&active_workspace) {
-            let temporary = workspace_leases.temporary_name();
-            anyhow::ensure!(
-                workspace_leases.claim(&temporary),
-                "could not claim temporary workspace {temporary}"
-            );
-            mux.set_active_workspace(&temporary);
-            log::warn!(
-                "workspace {} is already owned by another GUI; using temporary workspace {}",
-                active_workspace,
-                temporary
-            );
-        }
 
         let front_end = Rc::new(GuiFrontEnd {
             connection,
@@ -73,7 +56,6 @@ impl GuiFrontEnd {
             spawned_mux_window: RefCell::new(HashSet::new()),
             known_windows: RefCell::new(BTreeMap::new()),
             client_id: client_id.clone(),
-            workspace_leases: RefCell::new(workspace_leases),
             config_subscription: RefCell::new(None),
         });
 
@@ -384,33 +366,23 @@ impl GuiFrontEnd {
         let workspace = mux.active_workspace_for_client(&self.client_id);
 
         if mux.is_workspace_empty(&workspace) {
-            // Never replace an empty workspace while a switch or initial
-            // attach is still in flight. In particular, a temporary bystander
-            // may have an empty mux window briefly while its remote panes are
-            // being attached.
-            if self.is_switching_workspace() {
+            // Never reconcile an empty workspace while a switch or initial
+            // attach is in flight. A newly-created workspace is intentionally
+            // empty until its asynchronous first pane is spawned; closing the
+            // current GUI window here leaves the GUI with no native window.
+            let creating = mux.workspace_is_being_created_for_client(&self.client_id);
+            if self.is_switching_workspace() || creating {
                 promise.ok(());
                 return promise.get_future().unwrap();
             }
 
-            // We don't want to silently kill off things that might
-            // be running in other workspaces, so let's pick one
-            // and activate it. Ephemeral bystanders and a newly reserved
-            // workspace are deliberately excluded: the latter must remain
-            // active until SpawnV2 materializes its first pane, otherwise the
-            // asynchronous create path falls back to the old workspace and
-            // opens a second GUI window with the same workspace name.
-            let creating = mux.workspace_is_being_created_for_client(&self.client_id);
-            if !creating && !is_ephemeral_workspace(&workspace) {
-                for workspace in mux.iter_workspaces() {
-                    if !is_ephemeral_workspace(&workspace)
-                        && !mux.is_workspace_empty(&workspace)
-                        && self.workspace_leases.borrow_mut().claim(&workspace)
-                    {
-                        mux.set_active_workspace_for_client(&self.client_id, &workspace);
-                        log::debug!("using {} instead, as it is not empty", workspace);
-                        break;
-                    }
+            // We don't want to silently kill off things that might be
+            // running in other workspaces, so pick one non-empty workspace.
+            for workspace in mux.iter_workspaces() {
+                if !mux.is_workspace_empty(&workspace) {
+                    mux.set_active_workspace_for_client(&self.client_id, &workspace);
+                    log::debug!("using {} instead, as it is not empty", workspace);
+                    break;
                 }
             }
         }
@@ -509,20 +481,6 @@ impl GuiFrontEnd {
             log::debug!("ignoring duplicate in-flight creation of workspace {workspace}");
             *self.switching_workspaces.borrow_mut() = false;
             return false;
-        }
-        if !self.workspace_leases.borrow_mut().claim(workspace) {
-            log::warn!(
-                "refusing workspace switch to {workspace}; another GUI owns it"
-            );
-            *self.switching_workspaces.borrow_mut() = false;
-            // The remote pane list may have created windows for the rejected
-            // workspace before ownership was confirmed. Reconcile immediately
-            // so a denied switch cannot leave a second GUI window visible.
-            self.reconcile_workspace();
-            return false;
-        }
-        if current != workspace {
-            self.workspace_leases.borrow_mut().release(&current);
         }
         mux.set_active_workspace_for_client_with_create(&self.client_id, workspace, create);
         *self.switching_workspaces.borrow_mut() = false;

@@ -1,19 +1,8 @@
 use crate::cli::session_state::{resolve_path, write_atomic, SessionSnapshot};
 use clap::{Parser, ValueHint};
-use mux::tab::PaneNode;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use wezterm_client::client::Client;
-
-fn pane_node_workspace(node: &PaneNode) -> Option<&str> {
-    match node {
-        PaneNode::Empty => None,
-        PaneNode::Leaf(entry) => Some(entry.workspace.as_str()),
-        PaneNode::Split { left, right, .. } => {
-            pane_node_workspace(left).or_else(|| pane_node_workspace(right))
-        }
-    }
-}
 
 /// Save the native mux topology and pane metadata to a versioned snapshot.
 #[derive(Debug, Parser, Clone)]
@@ -32,11 +21,6 @@ impl SaveStateCommand {
         let mut retained_windows = HashSet::new();
 
         for (tab, title) in mux.tabs.into_iter().zip(mux.tab_titles.into_iter()) {
-            let ephemeral = pane_node_workspace(&tab)
-                .is_some_and(mux::is_ephemeral_workspace);
-            if ephemeral {
-                continue;
-            }
             if let Some((window_id, _)) = tab.window_and_tab_ids() {
                 retained_windows.insert(window_id);
             }

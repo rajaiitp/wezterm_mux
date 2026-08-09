@@ -12,7 +12,7 @@ use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
-use mux::{is_ephemeral_workspace, Mux};
+use mux::Mux;
 use mux_lua::MuxDomain;
 use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
@@ -58,7 +58,6 @@ mod unicode_names;
 mod uniforms;
 mod update;
 mod utilsprites;
-mod workspace;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -290,14 +289,6 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     workspace: Option<String>,
 ) -> anyhow::Result<()> {
     let mux = Mux::get();
-    // If GUI ownership moved this client into a temporary bystander before
-    // attach, scope the initial spawn check to that workspace. Otherwise the
-    // presence of panes in another workspace would leave the bystander empty.
-    let workspace = workspace.or_else(|| {
-        let active = mux.active_workspace();
-        is_ephemeral_workspace(&active).then_some(active)
-    });
-
     let domain = domain.unwrap_or_else(|| mux.default_domain());
 
     if !is_connecting {

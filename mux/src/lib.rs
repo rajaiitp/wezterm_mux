@@ -52,25 +52,6 @@ pub mod window;
 use crate::activity::Activity;
 
 pub const DEFAULT_WORKSPACE: &str = "default";
-/// GUI-only bystander workspaces used while attaching a second view.
-/// They must never be included in persistent session snapshots.
-pub const TEMP_WORKSPACE_PREFIX: &str = "WEZ_#";
-
-pub fn is_ephemeral_workspace(name: &str) -> bool {
-    if name.starts_with(TEMP_WORKSPACE_PREFIX) {
-        return true;
-    }
-
-    // Compatibility with the previous `workspace-view-<pid>` naming scheme.
-    name.rsplit_once("-view-")
-        .map(|(_, suffix)| {
-            !suffix.is_empty()
-                && suffix
-                    .split('-')
-                    .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
-        })
-        .unwrap_or(false)
-}
 
 #[derive(Clone, Debug)]
 pub enum MuxNotification {
