@@ -11,7 +11,7 @@ use crate::overlay::quickselect;
 use crate::overlay::selector::{matcher_pattern, matcher_score};
 use crate::termwindow::TermWindowNotif;
 use config::configuration;
-use config::keyassignment::{KeyAssignment, SpawnCommand, SpawnTabDomain};
+use config::keyassignment::{KeyAssignment, PromptInputLine, SpawnCommand, SpawnTabDomain};
 use mux::domain::{DomainId, DomainState};
 use mux::pane::PaneId;
 use mux::termwiztermtab::TermWizTerminal;
@@ -80,7 +80,7 @@ impl LauncherArgs {
         let active_workspace = mux.active_workspace();
 
         let workspaces = if flags.contains(LauncherFlags::WORKSPACES) {
-            mux.iter_workspaces()
+            crate::workspace::ordered_workspace_names()
         } else {
             vec![]
         };
@@ -287,10 +287,12 @@ impl LauncherState {
                     "Create new Workspace (current is `{}`)",
                     args.active_workspace
                 ),
-                action: KeyAssignment::SwitchToWorkspace {
-                    name: None,
-                    spawn: None,
-                },
+                action: KeyAssignment::PromptInputLine(PromptInputLine {
+                    action: Box::new(KeyAssignment::EmitEvent("native-new-workspace".to_string())),
+                    initial_value: None,
+                    description: "New workspace".to_string(),
+                    prompt: "> ".to_string(),
+                }),
             });
         }
 

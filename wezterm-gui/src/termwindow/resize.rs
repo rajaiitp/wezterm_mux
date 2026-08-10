@@ -41,9 +41,18 @@ impl super::TermWindow {
             log::trace!("new dimensions are zero: NOP!");
             return;
         }
+        if self.closing {
+            log::trace!("ignoring resize while closing the GUI window");
+            return;
+        }
+        self.has_received_resize = true;
         if self.dimensions == dimensions && self.window_state == window_state {
-            // It didn't really change
-            log::trace!("dimensions didn't change NOP!");
+            // The first compositor configure can report the requested size
+            // unchanged. Still rebuild the title/status bar: native workspace
+            // pills may have been rendered before the window had its final
+            // configured dimensions.
+            log::trace!("dimensions didn't change; refreshing title/status");
+            self.update_title();
             return;
         }
         let last_state = self.window_state;

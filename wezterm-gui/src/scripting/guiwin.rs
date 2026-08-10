@@ -100,6 +100,14 @@ impl UserData for GuiWin {
             this.window.notify(TermWindowNotif::SetRightStatus(status));
             Ok(())
         });
+        methods.add_method(
+            "set_right_status_click_targets",
+            |_, this, workspaces: Vec<String>| {
+                this.window
+                    .notify(TermWindowNotif::SetRightStatusClickTargets(workspaces));
+                Ok(())
+            },
+        );
         methods.add_method("set_left_status", |_, this, status: String| {
             this.window.notify(TermWindowNotif::SetLeftStatus(status));
             Ok(())

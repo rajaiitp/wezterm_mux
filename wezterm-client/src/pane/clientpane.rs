@@ -387,6 +387,13 @@ impl Pane for ClientPane {
     }
 
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+        if self
+            .client
+            .closing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
         let render = self.renderable.lock();
         let mut inner = render.inner.borrow_mut();
 
@@ -410,6 +417,12 @@ impl Pane for ClientPane {
             let remote_pane_id = self.remote_pane_id;
             let remote_tab_id = self.remote_tab_id;
             promise::spawn::spawn(async move {
+                if client
+                    .closing
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Ok(());
+                }
                 client
                     .client
                     .resize(Resize {
@@ -418,6 +431,7 @@ impl Pane for ClientPane {
                         size,
                     })
                     .await
+                    .map(|_| ())
             })
             .detach();
             inner.update_last_send();

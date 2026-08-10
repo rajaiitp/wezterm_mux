@@ -55,6 +55,7 @@ mod stats;
 mod tabbar;
 mod termwindow;
 mod unicode_names;
+mod workspace;
 mod uniforms;
 mod update;
 mod utilsprites;

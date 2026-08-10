@@ -1,7 +1,8 @@
 use crate::commands::CommandDef;
 use config::keyassignment::{
-    ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment, KeyTableEntry, KeyTables,
-    MouseEventTrigger, SelectionMode,
+    ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment, KeyTable, KeyTableEntry,
+    KeyTables, LauncherActionArgs, LauncherFlags, MouseEventTrigger, SelectionMode, SpawnCommand,
+    SpawnTabDomain,
 };
 use config::{ConfigHandle, MouseEventAltScreen, MouseEventTriggerMods};
 use std::collections::{BTreeMap, HashMap};
@@ -9,6 +10,160 @@ use std::time::Duration;
 use wezterm_dynamic::{ToDynamic, Value};
 use wezterm_term::input::MouseButton;
 use window::{KeyCode, Modifiers, PhysKeyCode, UIKeyCapRendering};
+
+fn add_leader_default(keys: &mut KeyTables, key: KeyCode, action: KeyAssignment) {
+    keys.default
+        .entry((key, Modifiers::LEADER))
+        .or_insert(KeyTableEntry { action });
+}
+
+fn add_resize_default(table: &mut KeyTable, key: KeyCode, action: KeyAssignment) {
+    table
+        .entry((key, Modifiers::NONE))
+        .or_insert(KeyTableEntry { action });
+}
+
+/// Install the tmux-style Ctrl+B core bindings when a leader is configured.
+/// Explicit config entries win, so users can still override any of these
+/// defaults without having to disable the entire built-in keymap.
+fn install_leader_defaults(keys: &mut KeyTables) {
+    use KeyAssignment::*;
+
+    add_leader_default(
+        keys,
+        KeyCode::Char('h'),
+        ActivatePaneDirection(config::keyassignment::PaneDirection::Left),
+    );
+    add_leader_default(
+        keys,
+        KeyCode::Char('j'),
+        ActivatePaneDirection(config::keyassignment::PaneDirection::Down),
+    );
+    add_leader_default(
+        keys,
+        KeyCode::Char('k'),
+        ActivatePaneDirection(config::keyassignment::PaneDirection::Up),
+    );
+    add_leader_default(
+        keys,
+        KeyCode::Char('l'),
+        ActivatePaneDirection(config::keyassignment::PaneDirection::Right),
+    );
+    add_leader_default(
+        keys,
+        KeyCode::Char('v'),
+        SplitHorizontal(SpawnCommand {
+            domain: SpawnTabDomain::CurrentPaneDomain,
+            ..Default::default()
+        }),
+    );
+    add_leader_default(
+        keys,
+        KeyCode::Char('-'),
+        SplitVertical(SpawnCommand {
+            domain: SpawnTabDomain::CurrentPaneDomain,
+            ..Default::default()
+        }),
+    );
+    add_leader_default(
+        keys,
+        KeyCode::Char('c'),
+        SpawnTab(SpawnTabDomain::CurrentPaneDomain),
+    );
+    add_leader_default(keys, KeyCode::Char('p'), ActivateTabRelative(-1));
+    add_leader_default(keys, KeyCode::Char('n'), ActivateTabRelative(1));
+    add_leader_default(
+        keys,
+        KeyCode::Char('x'),
+        CloseCurrentPane { confirm: false },
+    );
+    add_leader_default(keys, KeyCode::Char('z'), TogglePaneZoomState);
+    add_leader_default(keys, KeyCode::Char('\t'), SwitchWorkspaceRelative(-1));
+    add_leader_default(
+        keys,
+        KeyCode::Char('s'),
+        ShowLauncherArgs(LauncherActionArgs {
+            flags: LauncherFlags::FUZZY | LauncherFlags::WORKSPACES,
+            title: Some("Choose workspace".to_string()),
+            help_text: None,
+            fuzzy_help_text: None,
+            alphabet: None,
+        }),
+    );
+    add_leader_default(
+        keys,
+        KeyCode::Char('w'),
+        ShowLauncherArgs(LauncherActionArgs {
+            flags: LauncherFlags::FUZZY | LauncherFlags::WORKSPACES,
+            title: Some("Choose workspace".to_string()),
+            help_text: None,
+            fuzzy_help_text: None,
+            alphabet: None,
+        }),
+    );
+    keys.default.insert(
+        (KeyCode::Char('\t'), Modifiers::CTRL),
+        KeyTableEntry {
+            action: SwitchWorkspaceRelative(-1),
+        },
+    );
+    add_leader_default(
+        keys,
+        KeyCode::Char('r'),
+        ActivateKeyTable {
+            name: "resize_pane".to_string(),
+            timeout_milliseconds: Some(3000),
+            replace_current: false,
+            one_shot: false,
+            until_unknown: false,
+            prevent_fallback: false,
+        },
+    );
+
+    let resize_pane = keys.by_name.entry("resize_pane".to_string()).or_default();
+    add_resize_default(
+        resize_pane,
+        KeyCode::Char('h'),
+        AdjustPaneSize(config::keyassignment::PaneDirection::Left, 5),
+    );
+    add_resize_default(
+        resize_pane,
+        KeyCode::Char('j'),
+        AdjustPaneSize(config::keyassignment::PaneDirection::Down, 5),
+    );
+    add_resize_default(
+        resize_pane,
+        KeyCode::Char('k'),
+        AdjustPaneSize(config::keyassignment::PaneDirection::Up, 5),
+    );
+    add_resize_default(
+        resize_pane,
+        KeyCode::Char('l'),
+        AdjustPaneSize(config::keyassignment::PaneDirection::Right, 5),
+    );
+    add_resize_default(
+        resize_pane,
+        KeyCode::LeftArrow,
+        AdjustPaneSize(config::keyassignment::PaneDirection::Left, 5),
+    );
+    add_resize_default(
+        resize_pane,
+        KeyCode::DownArrow,
+        AdjustPaneSize(config::keyassignment::PaneDirection::Down, 5),
+    );
+    add_resize_default(
+        resize_pane,
+        KeyCode::UpArrow,
+        AdjustPaneSize(config::keyassignment::PaneDirection::Up, 5),
+    );
+    add_resize_default(
+        resize_pane,
+        KeyCode::RightArrow,
+        AdjustPaneSize(config::keyassignment::PaneDirection::Right, 5),
+    );
+    add_resize_default(resize_pane, KeyCode::Char('\x1b'), PopKeyTable);
+    add_resize_default(resize_pane, KeyCode::Char('\r'), PopKeyTable);
+}
 
 pub struct InputMap {
     pub keys: KeyTables,
@@ -83,6 +238,9 @@ impl InputMap {
                 keys.default
                     .entry((code, mods))
                     .or_insert(KeyTableEntry { action });
+            }
+            if leader.is_some() {
+                install_leader_defaults(&mut keys);
             }
         }
 

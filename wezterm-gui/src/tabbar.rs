@@ -490,8 +490,19 @@ impl TabBarState {
         let titles_len: usize = tab_titles.iter().map(|s| s.len).sum();
         let number_of_tabs = tab_titles.len();
 
-        let available_cells =
-            title_width.saturating_sub(number_of_tabs.saturating_sub(1) + new_tab.len());
+        // Reserve room for both status regions before sizing tabs. Without
+        // this, a long tab/title set can consume the entire initial width and
+        // the right-side workspace pills are rendered past the window edge.
+        let left_status_width = parse_status_text(left_status, CellAttributes::default()).len();
+        let right_status_width = parse_status_text(right_status, CellAttributes::default())
+            .len()
+            .min(title_width);
+        let fixed_width = number_of_tabs
+            .saturating_sub(1)
+            .saturating_add(new_tab.len())
+            .saturating_add(left_status_width)
+            .saturating_add(right_status_width);
+        let available_cells = title_width.saturating_sub(fixed_width);
         let tab_width_max = if config.use_fancy_tab_bar || available_cells >= titles_len {
             // We can render each title with its full width
             usize::max_value()
@@ -672,17 +683,27 @@ impl TabBarState {
         let status_space_available = title_width.saturating_sub(x);
 
         let mut right_status_line = parse_status_text(right_status, black_cell.attrs().clone());
+        log::trace!(
+            "tab bar layout width={} tabs={} titles={} available={} used={} status={} status_space={}",
+            title_width,
+            number_of_tabs,
+            titles_len,
+            available_cells,
+            x,
+            right_status_line.len(),
+            status_space_available,
+        );
         // The status text is right-aligned into the remaining tab-bar space,
         // but only the rendered status pill should be clickable. The previous
         // hitbox covered every unused cell after the tabs, so clicking blank
         // tab-bar space unexpectedly opened the workspace selector.
-        let right_status_width = right_status_line.len().min(status_space_available);
-        let right_status_x = title_width.saturating_sub(right_status_width);
+        let rendered_right_status_width = right_status_line.len().min(status_space_available);
+        let right_status_x = title_width.saturating_sub(rendered_right_status_width);
         items.push(TabEntry {
             item: TabBarItem::RightStatus,
             title: right_status_line.clone(),
             x: right_status_x,
-            width: right_status_width,
+            width: rendered_right_status_width,
         });
 
         while right_status_line.len() > status_space_available {

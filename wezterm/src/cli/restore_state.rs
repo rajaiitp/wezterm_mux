@@ -3,7 +3,7 @@ use clap::{Parser, ValueHint};
 use config::keyassignment::SpawnTabDomain;
 use config::ConfigHandle;
 use mux::pane::PaneId;
-use mux::tab::{PaneEntry, PaneNode, SplitDirection, SplitRequest, SplitSize};
+use mux::tab::{PaneEntry, PaneNode, SplitDirection, SplitRequest, SplitSize, TabId};
 use mux::window::WindowId;
 use portable_pty::cmdbuilder::CommandBuilder;
 use std::collections::HashMap;
@@ -53,15 +53,16 @@ impl RestoreStateCommand {
             tabs,
             tab_titles,
             window_titles,
-            ..
+            active_tabs,
         } = snapshot.mux;
         let mut window_ids = HashMap::<WindowId, WindowId>::new();
         let mut focused_pane = None;
+        let mut restored_active_panes = HashMap::<TabId, PaneId>::new();
         let mut restored_tabs = 0usize;
         let mut restored_panes = 0usize;
 
         for (root, tab_title) in tabs.into_iter().zip(tab_titles.into_iter()) {
-            let Some((old_window_id, _old_tab_id)) = root.window_and_tab_ids() else {
+            let Some((old_window_id, old_tab_id)) = root.window_and_tab_ids() else {
                 continue;
             };
             let Some(root_size) = root.root_size() else {
@@ -112,6 +113,9 @@ impl RestoreStateCommand {
                 saved: first.clone(),
                 actual: spawned.pane_id,
             }];
+            if first.is_active_pane {
+                restored_active_panes.insert(old_tab_id, spawned.pane_id);
+            }
             let mut zoomed_panes = Vec::new();
             if first.is_zoomed_pane {
                 zoomed_panes.push((spawned.tab_id, spawned.pane_id));
@@ -135,6 +139,7 @@ impl RestoreStateCommand {
 
                 if entry.is_active_pane {
                     focused_pane = Some(spawned_pane.pane_id);
+                    restored_active_panes.insert(old_tab_id, spawned_pane.pane_id);
                 }
                 if entry.is_zoomed_pane {
                     zoomed_panes.push((spawned_pane.tab_id, spawned_pane.pane_id));
@@ -157,10 +162,29 @@ impl RestoreStateCommand {
             restored_tabs += 1;
         }
 
-        if let Some(pane_id) = focused_pane {
+        // ListPanes carries the active tab for every mux window, but the
+        // restore path used to discard it. Focusing each restored active pane
+        // reestablishes the corresponding active tab without changing the
+        // order in which tabs were spawned.
+        let mut restored_active_tab = false;
+        for (old_window_id, old_tab_id) in active_tabs {
+            let Some(pane_id) = restored_active_panes.get(&old_tab_id).copied() else {
+                continue;
+            };
+            if !window_ids.contains_key(&old_window_id) {
+                continue;
+            }
             client
                 .set_focused_pane_id(codec::SetFocusedPane { pane_id })
                 .await?;
+            restored_active_tab = true;
+        }
+        if !restored_active_tab {
+            if let Some(pane_id) = focused_pane {
+                client
+                    .set_focused_pane_id(codec::SetFocusedPane { pane_id })
+                    .await?;
+            }
         }
 
         if self.consume {

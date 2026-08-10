@@ -159,6 +159,7 @@ pub enum TermWindowNotif {
     },
     SetLeftStatus(String),
     SetRightStatus(String),
+    SetRightStatusClickTargets(Vec<String>),
     GetDimensions(Sender<(Dimensions, WindowState)>),
     GetSelectionForPane {
         pane_id: PaneId,
@@ -418,6 +419,12 @@ pub struct TermWindow {
     /// Window dimensions and dpi
     pub dimensions: Dimensions,
     pub window_state: WindowState,
+    /// Once the compositor has supplied a real geometry, that size is
+    /// authoritative for tabs arriving from the persistent mux.
+    has_received_resize: bool,
+    /// Stop forwarding late compositor/teardown resizes after Win+Q begins
+    /// closing this client window.
+    closing: bool,
     pub resizes_pending: usize,
     is_repaint_pending: bool,
     pending_scale_changes: LinkedList<resize::ScaleChange>,
@@ -441,6 +448,7 @@ pub struct TermWindow {
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
+    right_status_click_targets: Vec<(String, usize, usize)>,
     last_ui_item: Option<UIItem>,
     /// Tracks whether the current mouse-down event is part of click-focus.
     /// If so, we ignore mouse events until released
@@ -533,6 +541,7 @@ impl TermWindow {
         // client instead of killing the server-owned panes. A new GUI can
         // attach to the same live processes afterward.
         if is_client_domain_window(self.mux_window_id) {
+            self.closing = true;
             detach_client_domains();
             window.close();
             front_end().forget_known_window(window);
@@ -543,6 +552,7 @@ impl TermWindow {
         match self.config.window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => {
                 // Immediately kill the tabs and allow the window to close
+                self.closing = true;
                 mux.kill_window(self.mux_window_id);
                 window.close();
                 front_end().forget_known_window(window);
@@ -656,11 +666,40 @@ impl TermWindow {
                 Default::default()
             }
         };
-        let physical_rows = size.rows as usize;
-        let physical_cols = size.cols as usize;
+        let mut physical_rows = size.rows as usize;
+        let mut physical_cols = size.cols as usize;
 
         let render_metrics = RenderMetrics::new(&fontconfig)?;
         log::trace!("using render_metrics {:#?}", render_metrics);
+
+        // A persistent mux can retain the dimensions of a previous GUI or
+        // monitor. Clamp that stale size before creating the native window so
+        // a large pane does not produce a window that extends beyond the
+        // active screen and crops the right-side workspace bar.
+        if let Some(connection) = Connection::get() {
+            if let Ok(screens) = connection.screens() {
+                let active = screens.active.rect;
+                let cell_width = render_metrics.cell_size.width as usize;
+                let cell_height = render_metrics.cell_size.height as usize;
+                let max_cols = (active.width().max(0) as usize / cell_width)
+                    .saturating_sub(2)
+                    .max(1);
+                let max_rows = (active.height().max(0) as usize / cell_height)
+                    .saturating_sub(3)
+                    .max(1);
+                if physical_cols > max_cols || physical_rows > max_rows {
+                    log::info!(
+                        "clamping initial mux size {}x{} to active screen {}x{}",
+                        physical_cols,
+                        physical_rows,
+                        max_cols,
+                        max_rows,
+                    );
+                    physical_cols = physical_cols.min(max_cols);
+                    physical_rows = physical_rows.min(max_rows);
+                }
+            }
+        }
 
         // Initially we have only a single tab, so take that into account
         // for the tab bar state.
@@ -762,6 +801,8 @@ impl TermWindow {
             render_metrics,
             dimensions,
             window_state: WindowState::default(),
+            has_received_resize: false,
+            closing: false,
             resizes_pending: 0,
             is_repaint_pending: false,
             pending_scale_changes: LinkedList::new(),
@@ -776,6 +817,7 @@ impl TermWindow {
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
+            right_status_click_targets: Vec::new(),
             last_mouse_coords: (0, -1),
             window_drag_position: None,
             current_mouse_event: None,
@@ -951,10 +993,26 @@ impl TermWindow {
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
             myself.emit_status_event();
+            // The initial status event can run before the native tab-bar state
+            // has been painted. Render the title/status bar once explicitly so
+            // workspace pills are present immediately on startup.
+            myself.update_title();
         }
 
         crate::update::start_update_checker();
-        front_end().record_known_window(window, mux_window_id);
+        front_end().record_known_window(window.clone(), mux_window_id);
+
+        // Wayland and tiled compositors may apply the final window geometry
+        // asynchronously after the initial configure event. Refresh once after
+        // that settles so the native workspace bar is laid out using the real
+        // width; keyboard input should not be required to trigger the redraw.
+        promise::spawn::spawn(async move {
+            Timer::after(Duration::from_millis(250)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                term_window.update_title();
+            })));
+        })
+        .detach();
 
         Ok(())
     }
@@ -1228,6 +1286,9 @@ impl TermWindow {
                     self.schedule_next_status_update();
                 }
             }
+            TermWindowNotif::SetRightStatusClickTargets(workspaces) => {
+                self.set_right_status_click_targets(&workspaces);
+            }
             TermWindowNotif::GetDimensions(tx) => {
                 tx.try_send((self.dimensions, self.window_state))
                     .map_err(chan_err)
@@ -1322,11 +1383,12 @@ impl TermWindow {
                     let mut size = self.terminal_size;
                     if let Some(tab) = mux.get_tab(tab_id) {
                         let tab_size = tab.get_size();
-                        if !self.window_state.can_resize() {
-                            // Tiling compositors own the window geometry. A
-                            // restored tab can still carry the old full-screen
-                            // cell size; never let that stale size grow a
-                            // half-screen window back to its previous width.
+                        if self.has_received_resize || !self.window_state.can_resize() {
+                            // Once the compositor has supplied a geometry, it
+                            // is authoritative. A restored split tab can still
+                            // carry an old full-screen size; never let that
+                            // stale size grow the current window and crop its
+                            // content or workspace bar.
                             if tab_size != self.terminal_size {
                                 log::debug!(
                                     "syncing restored tab {} to compositor-owned size {:?}",
@@ -1399,8 +1461,14 @@ impl TermWindow {
                 | MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
-                | MuxNotification::Empty
-                | MuxNotification::WindowCreated(_) => {}
+                | MuxNotification::WindowCreated(_) => {
+                    // Workspace discovery and attachment happen after the
+                    // first window can be constructed. Rebuild the native
+                    // workspace status when those notifications arrive so
+                    // startup does not depend on a later keypress or repaint.
+                    self.update_title();
+                }
+                MuxNotification::Empty => {}
             },
             TermWindowNotif::EmitStatusUpdate => {
                 self.emit_status_event();
@@ -1645,6 +1713,52 @@ impl TermWindow {
     fn emit_status_event(&mut self) {
         self.emit_window_event("update-right-status", None);
         self.emit_window_event("update-status", None);
+    }
+
+    fn set_right_status_click_targets(&mut self, workspaces: &[String]) {
+        let mut offset = 1;
+        self.right_status_click_targets.clear();
+        for workspace in workspaces {
+            let label = if workspace == "default" {
+                "0"
+            } else {
+                workspace.as_str()
+            };
+            let segment = format!("   󱂬  {label}   ");
+            let width = wezterm_term::unicode_column_width(&segment, None);
+            let end = offset + width + 1;
+            self.right_status_click_targets
+                .push((workspace.clone(), offset, end));
+            offset = end;
+        }
+    }
+
+    pub(crate) fn workspace_at_right_status(&self, item: &UIItem) -> Option<String> {
+        // UIItem coordinates are pixels, while last_mouse_coords is measured
+        // in terminal cells.
+        let cell_width = self.render_metrics.cell_size.width as usize;
+        if cell_width == 0 {
+            return None;
+        }
+        let item_x = item.x / cell_width;
+        let item_width = item.width / cell_width;
+        let relative = self.last_mouse_coords.0 as isize - item_x as isize;
+        if relative < 0 || relative >= item_width as isize {
+            return None;
+        }
+
+        let total_width = self
+            .right_status_click_targets
+            .last()
+            .map(|(_, _, end)| *end)
+            .unwrap_or(0);
+        let content_x = total_width
+            .saturating_sub(item_width)
+            .saturating_add(relative as usize);
+        self.right_status_click_targets
+            .iter()
+            .find(|(_, start, end)| content_x >= *start && content_x < *end)
+            .map(|(workspace, _, _)| workspace.clone())
     }
 
     fn schedule_window_event(&mut self, name: &str, pane_id: Option<PaneId>) {
@@ -2071,6 +2185,21 @@ impl TermWindow {
             None => false,
         };
 
+        let (native_right_status, native_workspace_targets) =
+            if let Some(front_end) = crate::frontend::try_front_end() {
+                front_end.workspace_status(&mux.active_workspace())
+            } else {
+                (self.right_status.clone(), Vec::new())
+            };
+        self.set_right_status_click_targets(&native_workspace_targets);
+        log::trace!(
+            "workspace status window={} active={:?} targets={} status_bytes={}",
+            self.mux_window_id,
+            mux.active_workspace(),
+            native_workspace_targets.len(),
+            native_right_status.len(),
+        );
+
         let new_tab_bar = TabBarState::new(
             self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
             if hovering_in_tab_bar {
@@ -2083,15 +2212,19 @@ impl TermWindow {
             self.config.resolved_palette.tab_bar.as_ref(),
             &self.config,
             &self.left_status,
-            &self.right_status,
+            &native_right_status,
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();
             self.invalidate_modal();
-            if let Some(window) = self.window.as_ref() {
-                window.invalidate();
-            }
+        }
+        // A title/status update can happen before the first frame is painted;
+        // if the tab-bar state is already equal, the change still needs an
+        // explicit repaint. This is especially important for the startup
+        // workspace pills, which otherwise appear only after another UI event.
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
         }
 
         let num_tabs = window.len();
@@ -2287,6 +2420,7 @@ impl TermWindow {
 
             self.update_title();
             self.update_scrollbar();
+            crate::frontend::schedule_native_session_save();
         }
         Ok(())
     }
@@ -2354,6 +2488,10 @@ impl TermWindow {
         drop(window);
         self.update_title();
         self.update_scrollbar();
+        // Tab movement changes the ordered Vec in the mux window. Persist it
+        // promptly; a GUI detach otherwise skips the final save because the
+        // local client panes have already been removed.
+        crate::frontend::schedule_native_session_save();
 
         Ok(())
     }
@@ -3140,17 +3278,25 @@ impl TermWindow {
                 tab.set_zoomed(*zoomed);
             }
             SwitchWorkspaceRelative(delta) => {
+                if *delta == -1 {
+                    if let Some(workspace) = front_end().previous_workspace() {
+                        front_end().switch_workspace(&workspace, false);
+                    }
+                    return Ok(PerformAssignmentResult::Handled);
+                }
+
                 let mux = Mux::get();
                 let workspace = mux.active_workspace();
-                let workspaces = mux.iter_workspaces();
+                let workspaces: Vec<String> = mux
+                    .iter_workspaces()
+                    .into_iter()
+                    .filter(|name| name != crate::workspace::DEFAULT_WORKSPACE)
+                    .collect();
+                if workspaces.is_empty() {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 let idx = workspaces.iter().position(|w| *w == workspace).unwrap_or(0);
-                let new_idx = idx as isize + delta;
-                let new_idx = if new_idx < 0 {
-                    workspaces.len() as isize + new_idx
-                } else {
-                    new_idx
-                };
-                let new_idx = new_idx as usize % workspaces.len();
+                let new_idx = (idx as isize + delta).rem_euclid(workspaces.len() as isize) as usize;
                 if let Some(w) = workspaces.get(new_idx) {
                     front_end().switch_workspace(w, false);
                 }
@@ -3163,10 +3309,8 @@ impl TermWindow {
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| mux.generate_workspace_name());
                 let create_workspace = !mux.workspace_exists(&name);
-                let switcher = crate::frontend::WorkspaceSwitcher::new_with_create(
-                    &name,
-                    create_workspace,
-                );
+                let switcher =
+                    crate::frontend::WorkspaceSwitcher::new_with_create(&name, create_workspace);
 
                 if mux.iter_windows_in_workspace(&name).is_empty() {
                     if !switcher.do_switch() {

@@ -32,6 +32,9 @@ pub struct ClientInner {
     // resync workload on the GUI main thread and persistent mux.
     pub(crate) tab_resync_generation: AtomicU64,
     pub(crate) tab_resync_running: AtomicBool,
+    /// Prevent late pane-resize tasks from mutating the persistent mux while
+    /// the GUI client is being detached by Win+Q.
+    pub(crate) closing: AtomicBool,
 }
 
 impl ClientInner {
@@ -254,6 +257,7 @@ impl ClientInner {
             focused_remote_pane_id: Mutex::new(None),
             tab_resync_generation: AtomicU64::new(0),
             tab_resync_running: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -487,6 +491,9 @@ impl ClientDomain {
 
     pub fn perform_detach(&self) {
         log::info!("detached domain {}", self.local_domain_id);
+        if let Some(inner) = self.inner.lock().unwrap().as_ref() {
+            inner.closing.store(true, Ordering::Release);
+        }
         self.inner.lock().unwrap().take();
         let mux = Mux::get();
         mux.domain_was_detached(self.local_domain_id);

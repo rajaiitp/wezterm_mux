@@ -1,6 +1,7 @@
 use crate::scripting::guiwin::GuiWin;
 use crate::spawn::SpawnWhere;
 use crate::termwindow::TermWindowNotif;
+use crate::workspace::WorkspaceManager;
 use crate::TermWindow;
 use ::window::*;
 use anyhow::{Context, Error};
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
 use wezterm_toast_notification::*;
 
-fn schedule_native_session_save() {
+pub(crate) fn schedule_native_session_save() {
     promise::spawn::spawn(async {
         smol::Timer::after(std::time::Duration::from_millis(100)).await;
         if let Err(err) = smol::unblock(crate::native_session::save_now).await {
@@ -34,6 +35,7 @@ pub struct GuiFrontEnd {
     known_windows: RefCell<BTreeMap<Window, MuxWindowId>>,
     client_id: Arc<ClientId>,
     config_subscription: RefCell<Option<ConfigSubscription>>,
+    workspace_manager: RefCell<WorkspaceManager>,
 }
 
 impl Drop for GuiFrontEnd {
@@ -57,6 +59,7 @@ impl GuiFrontEnd {
             known_windows: RefCell::new(BTreeMap::new()),
             client_id: client_id.clone(),
             config_subscription: RefCell::new(None),
+            workspace_manager: RefCell::new(WorkspaceManager::new()),
         });
 
         mux.subscribe(move |n| {
@@ -65,6 +68,10 @@ impl GuiFrontEnd {
                     old_workspace,
                     new_workspace,
                 } => {
+                    let fe = crate::frontend::front_end();
+                    fe.workspace_manager
+                        .borrow_mut()
+                        .rename_workspace(&old_workspace, &new_workspace);
                     let mux = Mux::get();
                     let active = mux.active_workspace();
                     if active == old_workspace || active == new_workspace {
@@ -474,6 +481,18 @@ impl GuiFrontEnd {
     pub fn switch_workspace(&self, workspace: &str, create: bool) -> bool {
         let mux = Mux::get();
         let current = mux.active_workspace_for_client(&self.client_id);
+        if current == workspace && !create {
+            *self.switching_workspaces.borrow_mut() = false;
+            return true;
+        }
+        let window_ids: Vec<MuxWindowId> = self.known_windows.borrow().values().copied().collect();
+        {
+            let mut manager = self.workspace_manager.borrow_mut();
+            for window_id in &window_ids {
+                manager.remember_active_tab(*window_id, &current);
+            }
+            manager.note_switch(&current, workspace);
+        }
         if create
             && current == workspace
             && mux.workspace_is_being_created_for_client(&self.client_id)
@@ -485,7 +504,23 @@ impl GuiFrontEnd {
         mux.set_active_workspace_for_client_with_create(&self.client_id, workspace, create);
         *self.switching_workspaces.borrow_mut() = false;
         self.reconcile_workspace();
+        for window_id in window_ids {
+            self.workspace_manager
+                .borrow()
+                .restore_active_tab(window_id, workspace);
+        }
         true
+    }
+
+    pub fn workspace_status(&self, active: &str) -> (String, Vec<String>) {
+        self.workspace_manager.borrow_mut().status(active)
+    }
+
+    pub fn previous_workspace(&self) -> Option<String> {
+        let current = Mux::get().active_workspace_for_client(&self.client_id);
+        self.workspace_manager
+            .borrow_mut()
+            .previous_workspace(&current)
     }
 
     pub fn record_known_window(&self, window: Window, mux_window_id: MuxWindowId) {
@@ -496,9 +531,7 @@ impl GuiFrontEnd {
             // A mux window must have exactly one native GUI window. This is a
             // final guard against overlapping reconciliation tasks opening the
             // same workspace/window twice.
-            log::warn!(
-                "refusing duplicate native window for mux window {mux_window_id}"
-            );
+            log::warn!("refusing duplicate native window for mux window {mux_window_id}");
             window.close();
             return;
         }
