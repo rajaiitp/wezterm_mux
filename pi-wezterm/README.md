@@ -16,6 +16,17 @@ The extension activates only when WezTerm provides `WEZTERM_AUTOMATION_SOCKET`.
 The WezTerm mux server injects that variable together with `WEZTERM_PANE` into
 new panes.
 
+## Local build replacement
+
+From the repository root, rebuild and atomically replace the local binaries with:
+
+```sh
+./scripts/build-replace.sh
+```
+
+Set `WEZTERM_BIN_DIR` to replace binaries in another directory. Existing GUI and
+mux processes keep their old mapped binaries until they are restarted.
+
 ## Tools
 
 The extension exposes a small command interface: `terminal_run`,
