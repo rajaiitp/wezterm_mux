@@ -41,7 +41,7 @@ impl crate::TermWindow {
 
         let num_cols = params.dims.cols;
 
-        let hsv = if params.is_active {
+        let hsv = if params.is_active || params.config.inactive_pane_background.is_some() {
             None
         } else {
             Some(params.config.inactive_pane_hsb)

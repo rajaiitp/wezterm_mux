@@ -607,11 +607,22 @@ pub struct Config {
     #[dynamic(default = "default_one_point_oh")]
     pub active_pane_opacity: f32,
 
+    /// Overrides the terminal palette background for the active pane.
+    /// When unset, the palette background is used.
+    #[dynamic(default)]
+    pub active_pane_background: Option<RgbaColor>,
+
     /// Specifies the opacity of inactive pane backgrounds.
     /// The default is 1.0. Values below 1.0 allow the compositor background
     /// to show through inactive pane backgrounds.
     #[dynamic(default = "default_one_point_oh")]
     pub inactive_pane_opacity: f32,
+
+    /// Overrides the terminal palette background for inactive panes.
+    /// When set, inactive_pane_hsb is not applied so that the configured
+    /// background and text colors remain independent.
+    #[dynamic(default)]
+    pub inactive_pane_background: Option<RgbaColor>,
 
     /// inactive_pane_hue, inactive_pane_saturation and
     /// inactive_pane_brightness allow for transforming the color

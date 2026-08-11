@@ -16,11 +16,26 @@ use mux::tab::PositionedPane;
 use ordered_float::NotNan;
 use std::time::Instant;
 use wezterm_dynamic::Value;
-use wezterm_term::color::{ColorAttribute, ColorPalette};
+use wezterm_term::color::ColorPalette;
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 
 impl crate::TermWindow {
+    fn effective_pane_background(
+        &self,
+        pos: &PositionedPane,
+        palette: &ColorPalette,
+    ) -> LinearRgba {
+        let configured = if pos.is_active {
+            self.config.active_pane_background.as_ref()
+        } else {
+            self.config.inactive_pane_background.as_ref()
+        };
+        configured
+            .map(|color| (*color).to_linear())
+            .unwrap_or_else(|| palette.background.to_linear())
+    }
+
     fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
         let computed = self.build_pane(pos)?;
         let mut ui_items = computed.ui_items();
@@ -59,6 +74,7 @@ impl crate::TermWindow {
         let global_cursor_bg = self.palette().cursor_bg;
         let config = self.config.clone();
         let palette = pos.pane.palette();
+        let pane_background = self.effective_pane_background(pos, &palette);
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -104,14 +120,11 @@ impl crate::TermWindow {
             || config.window_background_opacity != 1.0
             || pane_backgrounds_are_transparent;
 
-        let default_bg = palette
-            .resolve_bg(ColorAttribute::Default)
-            .to_linear()
-            .mul_alpha(if window_is_transparent {
-                0.
-            } else {
-                config.text_background_opacity * pane_background_opacity
-            });
+        let default_bg = pane_background.mul_alpha(if window_is_transparent {
+            0.
+        } else {
+            config.text_background_opacity * pane_background_opacity
+        });
 
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
@@ -167,17 +180,17 @@ impl crate::TermWindow {
                     layers,
                     0,
                     background_rect,
-                    palette
-                        .background
-                        .to_linear()
+                    pane_background
                         .mul_alpha(config.window_background_opacity * pane_background_opacity),
                 )
                 .context("filled_rectangle")?;
-            quad.set_hsv(if pos.is_active {
-                None
-            } else {
-                Some(config.inactive_pane_hsb)
-            });
+            quad.set_hsv(
+                if pos.is_active || config.inactive_pane_background.is_some() {
+                    None
+                } else {
+                    Some(config.inactive_pane_hsb)
+                },
+            );
         }
 
         {
@@ -199,18 +212,11 @@ impl crate::TermWindow {
                 let background = if window_is_transparent {
                     // for transparent windows, we fade in the target color
                     // by adjusting its alpha
-                    LinearRgba::with_components(
-                        r,
-                        g,
-                        b,
-                        intensity * pane_background_opacity,
-                    )
+                    LinearRgba::with_components(r, g, b, intensity * pane_background_opacity)
                 } else {
                     // otherwise We'll interpolate between the background color
                     // and the target color
-                    let (r1, g1, b1, a) = palette
-                        .background
-                        .to_linear()
+                    let (r1, g1, b1, a) = pane_background
                         .mul_alpha(config.window_background_opacity * pane_background_opacity)
                         .tuple();
                     LinearRgba::with_components(
@@ -226,11 +232,13 @@ impl crate::TermWindow {
                     .filled_rectangle(layers, 0, background_rect, background)
                     .context("filled_rectangle")?;
 
-                quad.set_hsv(if pos.is_active {
-                    None
-                } else {
-                    Some(config.inactive_pane_hsb)
-                });
+                quad.set_hsv(
+                    if pos.is_active || config.inactive_pane_background.is_some() {
+                        None
+                    } else {
+                        Some(config.inactive_pane_hsb)
+                    },
+                );
             }
         }
 
@@ -673,6 +681,7 @@ impl crate::TermWindow {
         );
 
         let palette = pos.pane.palette();
+        let pane_background = self.effective_pane_background(pos, &palette);
         let pane_background_opacity = if pos.is_active {
             self.config.active_pane_opacity
         } else {
@@ -692,9 +701,7 @@ impl crate::TermWindow {
             colors: ElementColors {
                 border: BorderColor::default(),
                 bg: if self.window_background.is_empty() {
-                    palette
-                        .background
-                        .to_linear()
+                    pane_background
                         .mul_alpha(self.config.window_background_opacity * pane_background_opacity)
                         .into()
                 } else {
