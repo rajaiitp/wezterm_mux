@@ -174,14 +174,25 @@ impl WorkspaceManager {
         let Some(mut window) = mux.get_window_mut(window_id) else {
             return;
         };
-        let target = remembered.tab_title.as_deref().and_then(|title| {
-            window
-                .iter()
-                .enumerate()
-                .find(|(_, tab)| tab.get_title() == title)
-                .map(|(index, _)| index)
-        });
-        let target = target.or(remembered.tab_index);
+        // The index is the authoritative identity for the active tab. Empty
+        // titles are common, and searching by title first would always match
+        // the first tab and discard the remembered index.
+        let target = remembered
+            .tab_index
+            .filter(|index| *index < window.len())
+            .or_else(|| {
+                remembered
+                    .tab_title
+                    .as_deref()
+                    .filter(|title| !title.is_empty())
+                    .and_then(|title| {
+                        window
+                            .iter()
+                            .enumerate()
+                            .find(|(_, tab)| tab.get_title() == title)
+                            .map(|(index, _)| index)
+                    })
+            });
         if let Some(index) = target {
             if index < window.len() {
                 window.set_active_without_saving(index);

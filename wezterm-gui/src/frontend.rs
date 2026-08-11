@@ -421,6 +421,11 @@ impl GuiFrontEnd {
 
         for (window, old_id) in unused.into_iter() {
             if let Some(mux_window_id) = mux_windows.next() {
+                // Set the target mux window's active tab before the GUI is
+                // remapped to it; otherwise the first tab is briefly painted.
+                self.workspace_manager
+                    .borrow()
+                    .restore_active_tab(mux_window_id, &workspace);
                 window.notify(TermWindowNotif::SwitchToMuxWindow(mux_window_id));
                 windows.insert(window, mux_window_id);
             } else {
@@ -435,6 +440,7 @@ impl GuiFrontEnd {
         *self.known_windows.borrow_mut() = windows;
 
         let future = promise.get_future().unwrap();
+        let workspace_for_spawn = workspace.clone();
 
         // then spawn any new windows that are needed
         promise::spawn::spawn(async move {
@@ -451,6 +457,10 @@ impl GuiFrontEnd {
                     .spawned_mux_window
                     .borrow_mut()
                     .insert(mux_window_id);
+                front_end()
+                    .workspace_manager
+                    .borrow()
+                    .restore_active_tab(mux_window_id, &workspace_for_spawn);
                 log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
                 if let Err(err) = TermWindow::new_window(mux_window_id).await {
                     log::error!("Failed to create window: {:#}", err);
@@ -504,11 +514,6 @@ impl GuiFrontEnd {
         mux.set_active_workspace_for_client_with_create(&self.client_id, workspace, create);
         *self.switching_workspaces.borrow_mut() = false;
         self.reconcile_workspace();
-        for window_id in window_ids {
-            self.workspace_manager
-                .borrow()
-                .restore_active_tab(window_id, workspace);
-        }
         true
     }
 

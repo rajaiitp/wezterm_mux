@@ -48,7 +48,8 @@ for binary in "${BINARIES[@]}"; do
     [[ -x "$source" ]] || { printf 'missing build output: %s\n' "$source" >&2; exit 1; }
 
     tmp_file=$(mktemp "$INSTALL_DIR/.${binary}.new.XXXXXX")
-    cp --preserve=mode,timestamps -- "$source" "$tmp_file"
+    # `-p` preserves mode and timestamps on both BSD/macOS and GNU cp.
+    cp -p "$source" "$tmp_file"
     chmod 755 "$tmp_file"
     mv -f -- "$tmp_file" "$destination"
     tmp_file=""
