@@ -1,18 +1,29 @@
 use clap::*;
+use codec::ListPanesResponse;
 use config::configuration;
+use config::keyassignment::SpawnTabDomain;
 use mux::activity::Activity;
-use mux::domain::{Domain, LocalDomain};
+use mux::domain::{Domain, LocalDomain, SplitSource};
+use mux::tab::{PaneEntry, PaneNode, SplitDirection, SplitRequest, SplitSize, TabId};
+use mux::window::WindowId;
 use mux::Mux;
+use mux::MuxNotification;
 use portable_pty::cmdbuilder::CommandBuilder;
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use wezterm_gui_subcommands::*;
 use wezterm_mux_server_impl::update_mux_domains_for_server;
+use wezterm_session_state::{self as session_state, SessionSnapshot};
 
 mod daemonize;
 
@@ -261,77 +272,296 @@ async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
 }
 
 fn native_snapshot_path() -> Option<PathBuf> {
-    let state_dir = if let Some(path) = env::var_os("XDG_STATE_HOME") {
-        PathBuf::from(path)
-    } else if cfg!(target_os = "macos") {
-        PathBuf::from(env::var_os("HOME")?).join("Library/Application Support")
+    wezterm_session_state::default_path().ok()
+}
+
+fn native_session_enabled(name: &str, default: bool) -> bool {
+    match env::var(name).ok().as_deref() {
+        Some("0") | Some("false") | Some("no") => false,
+        Some("1") | Some("true") | Some("yes") => true,
+        _ => default,
+    }
+}
+
+fn capture_mux() -> ListPanesResponse {
+    let mux = Mux::get();
+    let mut tabs = vec![];
+    let mut tab_titles = vec![];
+    let mut window_titles = std::collections::HashMap::new();
+    let mut active_tabs = std::collections::HashMap::new();
+    for window_id in mux.iter_windows() {
+        if let Some(window) = mux.get_window(window_id) {
+            if let Some(tab) = window.get_active() {
+                active_tabs.insert(window_id, tab.tab_id());
+            }
+            window_titles.insert(window_id, window.get_title().to_string());
+            for tab in window.iter() {
+                tabs.push(tab.codec_pane_tree());
+                tab_titles.push(tab.get_title());
+            }
+        }
+    }
+    ListPanesResponse {
+        tabs,
+        tab_titles,
+        window_titles,
+        active_tabs,
+    }
+}
+
+fn save_native_snapshot() -> anyhow::Result<bool> {
+    if !native_session_enabled("WEZTERM_HERDR_NATIVE_SESSION_AUTOSAVE", true) {
+        return Ok(false);
+    }
+    let mux = capture_mux();
+    if mux.tabs.is_empty() {
+        return Ok(false);
+    }
+    let path = session_state::default_path()?;
+    session_state::write_atomic(&path, &SessionSnapshot::new(mux))?;
+    Ok(true)
+}
+
+fn start_native_autosave() {
+    if !native_session_enabled("WEZTERM_HERDR_NATIVE_SESSION_AUTOSAVE", true) {
+        return;
+    }
+    let interval = env::var("WEZTERM_HERDR_NATIVE_SESSION_INTERVAL")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300)
+        .max(10);
+    let dirty = Arc::new(AtomicBool::new(true));
+    let periodic_dirty = Arc::clone(&dirty);
+    Mux::get().subscribe_persistence(move |notification| {
+        if matches!(
+            notification,
+            MuxNotification::PaneAdded(_)
+                | MuxNotification::PaneRemoved(_)
+                | MuxNotification::WindowCreated(_)
+                | MuxNotification::WindowRemoved(_)
+                | MuxNotification::TabAddedToWindow { .. }
+                | MuxNotification::WindowWorkspaceChanged(_)
+                | MuxNotification::WorkspaceRenamed { .. }
+                | MuxNotification::TabTitleChanged { .. }
+                | MuxNotification::WindowTitleChanged { .. }
+                | MuxNotification::PaneFocused(_)
+                | MuxNotification::TabResized(_)
+        ) {
+            dirty.store(true, Ordering::Release);
+        }
+        true
+    });
+    promise::spawn::spawn(async move {
+        loop {
+            smol::Timer::after(Duration::from_secs(interval)).await;
+            if periodic_dirty.swap(false, Ordering::AcqRel) {
+                if let Err(err) = smol::unblock(save_native_snapshot).await {
+                    log::warn!("native session periodic save failed: {err:#}");
+                    periodic_dirty.store(true, Ordering::Release);
+                }
+            }
+        }
+    })
+    .detach();
+}
+
+#[derive(Debug, Clone)]
+struct RestoredPane {
+    saved: PaneEntry,
+    actual: mux::pane::PaneId,
+}
+
+fn collect_leaves(node: PaneNode, leaves: &mut Vec<PaneEntry>) {
+    match node {
+        PaneNode::Empty => {}
+        PaneNode::Leaf(entry) => leaves.push(entry),
+        PaneNode::Split { left, right, .. } => {
+            collect_leaves(*left, leaves);
+            collect_leaves(*right, leaves);
+        }
+    }
+}
+
+fn command_dir(entry: &PaneEntry) -> Option<String> {
+    entry
+        .working_dir
+        .as_ref()
+        .and_then(|url| url.url.to_file_path().ok())
+        .and_then(|path| path.to_str().map(ToOwned::to_owned))
+}
+
+fn shell_command(config: &config::ConfigHandle) -> Option<Vec<OsString>> {
+    config
+        .default_prog
+        .clone()
+        .map(|prog| prog.into_iter().map(OsString::from).collect())
+}
+
+fn restore_command(entry: &PaneEntry, _config: &config::ConfigHandle) -> Option<CommandBuilder> {
+    let process = entry.process.as_ref()?;
+    let candidates = [&process.name, &process.executable];
+    let name = candidates
+        .iter()
+        .map(|value| {
+            Path::new(value)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(value)
+        })
+        .find(|value| {
+            [
+                "nvim", "vim", "vi", "neovim", "pi", "claude", "codex", "tuxedo", "tuicr",
+            ]
+            .iter()
+            .any(|known| *value == *known || value.starts_with(&format!("{known}.")))
+        })?;
+    let argv = if !process.argv.is_empty() {
+        process.argv.iter().map(OsString::from).collect()
+    } else if !process.executable.is_empty() {
+        vec![OsString::from(&process.executable)]
     } else {
-        PathBuf::from(env::var_os("HOME")?).join(".local/state")
+        vec![OsString::from(name)]
     };
-    Some(state_dir.join("wezterm").join("herdr.json"))
+    Some(CommandBuilder::from_argv(argv))
+}
+
+fn split_for(entry: &PaneEntry, restored: &[RestoredPane]) -> (mux::pane::PaneId, SplitRequest) {
+    let target = restored
+        .iter()
+        .min_by_key(|candidate| {
+            candidate.saved.left_col.abs_diff(entry.left_col)
+                + candidate.saved.top_row.abs_diff(entry.top_row)
+        })
+        .expect("at least one restored pane");
+    let horizontal = entry.left_col >= target.saved.left_col + target.saved.size.cols;
+    let vertical = entry.top_row >= target.saved.top_row + target.saved.size.rows;
+    let direction = if horizontal {
+        SplitDirection::Horizontal
+    } else {
+        SplitDirection::Vertical
+    };
+    let size = if horizontal {
+        entry.size.cols
+    } else {
+        entry.size.rows
+    };
+    (
+        target.actual,
+        SplitRequest {
+            direction,
+            target_is_second: horizontal || vertical,
+            top_level: false,
+            size: SplitSize::Cells(size.max(1)),
+        },
+    )
+}
+
+async fn restore_snapshot_into_mux(
+    snapshot: wezterm_session_state::SessionSnapshot,
+    config: &config::ConfigHandle,
+) -> anyhow::Result<()> {
+    let mux = Mux::get();
+    let mut windows = HashMap::<WindowId, WindowId>::new();
+    let mut active_panes = HashMap::<TabId, mux::pane::PaneId>::new();
+    for (root, title) in snapshot
+        .mux
+        .tabs
+        .into_iter()
+        .zip(snapshot.mux.tab_titles.into_iter())
+    {
+        let Some((old_window, old_tab)) = root.window_and_tab_ids() else {
+            continue;
+        };
+        let Some(size) = root.root_size() else {
+            continue;
+        };
+        let mut leaves = vec![];
+        collect_leaves(root, &mut leaves);
+        leaves.sort_by_key(|entry| (entry.top_row, entry.left_col));
+        let first = leaves
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("snapshot tab has no panes"))?;
+        let (tab, pane, window) = mux
+            .spawn_tab_or_window(
+                windows.get(&old_window).copied(),
+                SpawnTabDomain::DefaultDomain,
+                restore_command(first, config)
+                    .or_else(|| shell_command(config).map(CommandBuilder::from_argv)),
+                command_dir(first),
+                size,
+                None,
+                first.workspace.clone(),
+                None,
+            )
+            .await?;
+        windows.insert(old_window, window);
+        tab.set_title(&title);
+        if let Some(window_title) = snapshot.mux.window_titles.get(&old_window) {
+            if let Some(mut window_ref) = mux.get_window_mut(window) {
+                window_ref.set_title(window_title);
+            }
+        }
+        let mut restored = vec![RestoredPane {
+            saved: first.clone(),
+            actual: pane.pane_id(),
+        }];
+        if first.is_active_pane {
+            active_panes.insert(old_tab, pane.pane_id());
+        }
+        for entry in leaves.into_iter().skip(1) {
+            let (target, request) = split_for(&entry, &restored);
+            let (new_pane, _) = mux
+                .split_pane(
+                    target,
+                    request,
+                    SplitSource::Spawn {
+                        command: restore_command(&entry, config)
+                            .or_else(|| shell_command(config).map(CommandBuilder::from_argv)),
+                        command_dir: command_dir(&entry),
+                    },
+                    SpawnTabDomain::CurrentPaneDomain,
+                )
+                .await?;
+            if entry.is_active_pane {
+                active_panes.insert(old_tab, new_pane.pane_id());
+            }
+            restored.push(RestoredPane {
+                saved: entry,
+                actual: new_pane.pane_id(),
+            });
+        }
+    }
+    for (old_window, old_tab) in snapshot.mux.active_tabs {
+        if let (Some(window), Some(pane_id)) =
+            (windows.get(&old_window), active_panes.get(&old_tab))
+        {
+            mux.focus_pane_and_containing_tab(*pane_id)?;
+            let _ = window;
+        }
+    }
+    Ok(())
 }
 
 async fn restore_native_snapshot(config: &config::ConfigHandle) -> anyhow::Result<bool> {
-    if matches!(
-        env::var("WEZTERM_HERDR_NATIVE_SESSION_RESTORE")
-            .ok()
-            .as_deref(),
-        Some("0" | "false" | "no")
-    ) {
+    if !native_session_enabled("WEZTERM_HERDR_NATIVE_SESSION_RESTORE", true) {
         return Ok(false);
     }
-
-    let Some(snapshot) = native_snapshot_path() else {
+    let Some(path) = native_snapshot_path() else {
         return Ok(false);
     };
-    if !snapshot.exists() {
+    if !path.exists() {
         return Ok(false);
     }
-
-    let Some(socket) = config
-        .unix_domains
-        .first()
-        .map(|domain| domain.socket_path())
-    else {
-        return Ok(false);
-    };
-    let current = env::current_exe()?;
-    let Some(parent) = current.parent() else {
-        return Ok(false);
-    };
-    let cli = parent.join(if cfg!(windows) {
-        "wezterm.exe"
-    } else {
-        "wezterm"
-    });
-    if !cli.exists() {
-        log::warn!("native snapshot CLI is missing at {}", cli.display());
-        return Ok(false);
+    let snapshot = session_state::read(&path)?;
+    restore_snapshot_into_mux(snapshot, config).await?;
+    if let Err(err) = fs::remove_file(&path) {
+        log::warn!(
+            "restored native snapshot but could not consume {}: {err}",
+            path.display()
+        );
     }
-
-    let output = smol::unblock(move || {
-        Command::new(cli)
-            .args([
-                "cli",
-                "--no-auto-start",
-                "--prefer-mux",
-                "restore-state",
-                "--consume",
-            ])
-            .arg("--file")
-            .arg(snapshot)
-            .env("WEZTERM_UNIX_SOCKET", socket)
-            .stdin(Stdio::null())
-            .output()
-    })
-    .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("native snapshot restore failed: {}", stderr.trim());
-    }
-
-    log::info!("restored native session snapshot into persistent mux");
+    log::info!("restored native session snapshot directly into persistent mux");
     Ok(true)
 }
 
@@ -340,6 +570,7 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
     let config = config::configuration();
 
     update_mux_domains_for_server(&config)?;
+    let domain = mux.default_domain();
     let _config_subscription = config::subscribe_to_config_reload(move || {
         promise::spawn::spawn_into_main_thread(async move {
             if let Err(err) = update_mux_domains_for_server(&config::configuration()) {
@@ -349,8 +580,6 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
         .detach();
         true
     });
-
-    let domain = mux.default_domain();
 
     {
         if let Err(err) = config::with_lua_config_on_main_thread(trigger_mux_startup).await {
@@ -382,6 +611,10 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
                 .await?;
         }
     }
+
+    // Persistence belongs to the long-lived mux process. GUI clients do not
+    // independently restore or periodically overwrite this snapshot.
+    start_native_autosave();
     Ok(())
 }
 
@@ -394,22 +627,29 @@ mod ossl;
 
 pub fn spawn_listener() -> anyhow::Result<()> {
     let config = configuration();
-    let mut automation_socket_set = false;
     for unix_dom in &config.unix_domains {
+        std::env::set_var(
+            format!("WEZTERM_UNIX_SOCKET_{}", unix_dom.name.to_ascii_uppercase()),
+            unix_dom.socket_path(),
+        );
+        std::env::set_var(
+            format!(
+                "WEZTERM_AUTOMATION_SOCKET_{}",
+                unix_dom.name.to_ascii_uppercase()
+            ),
+            wezterm_mux_server_impl::automation::socket_path(unix_dom),
+        );
         std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
         let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
         thread::spawn(move || {
             listener.run();
         });
 
-        // The first configured domain is the persistent/default domain in this
-        // fork. Export its native automation endpoint to all panes spawned by
-        // this server. Additional mux domains still receive their own
-        // endpoint when they are used as standalone servers.
-        if !automation_socket_set {
-            let automation = wezterm_mux_server_impl::automation::spawn_listener(unix_dom)?;
+        let automation = wezterm_mux_server_impl::automation::spawn_listener(unix_dom)?;
+        // Keep the legacy unqualified value for the first/default domain while
+        // also exposing every configured local domain explicitly.
+        if std::env::var_os("WEZTERM_AUTOMATION_SOCKET").is_none() {
             std::env::set_var("WEZTERM_AUTOMATION_SOCKET", automation);
-            automation_socket_set = true;
         }
     }
 

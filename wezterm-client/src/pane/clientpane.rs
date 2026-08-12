@@ -417,10 +417,7 @@ impl Pane for ClientPane {
             let remote_pane_id = self.remote_pane_id;
             let remote_tab_id = self.remote_tab_id;
             promise::spawn::spawn(async move {
-                if client
-                    .closing
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
+                if client.closing.load(std::sync::atomic::Ordering::Acquire) {
                     return Ok(());
                 }
                 client

@@ -41,6 +41,7 @@ mod download;
 mod frontend;
 mod glyphcache;
 mod inputmap;
+#[cfg(feature = "native_session_legacy")]
 mod native_session;
 mod overlay;
 mod quad;
@@ -55,10 +56,10 @@ mod stats;
 mod tabbar;
 mod termwindow;
 mod unicode_names;
-mod workspace;
 mod uniforms;
 mod update;
 mod utilsprites;
+mod workspace;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -415,6 +416,7 @@ fn cell_pixel_dims(config: &ConfigHandle, dpi: f64) -> anyhow::Result<(usize, us
     ))
 }
 
+#[cfg(feature = "native_session_legacy")]
 fn default_domain_is_unix_client() -> bool {
     let config = config::configuration();
     let Some(default_domain) = config.default_domain.as_deref() else {
@@ -476,9 +478,10 @@ async fn async_run_terminal_gui(
     if !opts.attach {
         trigger_and_log_gui_startup(spawn_command).await;
 
-        // Let Lua startup hooks restore their own state first. Native restore
-        // only runs when they left the mux empty, avoiding duplicate sessions
-        // while the migration period uses both mechanisms.
+        // Native session restore is owned by the persistent mux server. The
+        // GUI only attaches to that authoritative topology; retaining the
+        // old subprocess path requires the explicit migration feature.
+        #[cfg(feature = "native_session_legacy")]
         if cmd.is_none()
             && opts.workspace.is_none()
             && opts.domain.is_none()
@@ -814,6 +817,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     }
 
     let gui = crate::frontend::try_new()?;
+    #[cfg(feature = "native_session_legacy")]
     native_session::start_periodic_save();
     let activity = Activity::new();
 
@@ -827,6 +831,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     maybe_show_configuration_error_window();
     let result = gui.run_forever();
+    #[cfg(feature = "native_session_legacy")]
     if let Err(err) = native_session::save_now() {
         log::warn!("native session final save failed: {err:#}");
     }

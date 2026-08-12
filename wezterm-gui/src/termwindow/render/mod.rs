@@ -99,6 +99,10 @@ pub struct LineToEleShapeCacheKey {
     pub composing: Option<(usize, String)>,
     pub shape_generation: usize,
     pub pane_background_opacity: NotNan<f32>,
+    /// Resolved pane background identity. Background colors are baked into
+    /// shaped line elements, so opacity alone is insufficient for cache
+    /// invalidation when active/inactive pane backgrounds differ.
+    pub pane_background: LinearRgba,
 }
 
 pub struct LineToElementShapeItem {

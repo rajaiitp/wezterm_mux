@@ -327,11 +327,12 @@ fn process_unilateral(
                     let client_domain = mux
                         .get_domain(local_domain_id)
                         .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
-                    let client_domain = client_domain
-                        .downcast_ref::<ClientDomain>()
-                        .ok_or_else(|| {
-                            anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
-                        })?;
+                    let client_domain =
+                        client_domain
+                            .downcast_ref::<ClientDomain>()
+                            .ok_or_else(|| {
+                                anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
+                            })?;
 
                     let result = client_domain.resync().await;
                     let again = inner.finish_tab_resync(generation);

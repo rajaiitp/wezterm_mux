@@ -31,6 +31,7 @@ termwiz = { workspace=true, features=["use_serde"] }
 url.workspace = true
 wezterm-client.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
+wezterm-session-state.workspace = true
 wezterm-uds.workspace = true
 
 [target."cfg(windows)".dependencies]

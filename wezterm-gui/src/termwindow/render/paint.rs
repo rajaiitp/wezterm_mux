@@ -174,8 +174,8 @@ impl crate::TermWindow {
 
         let panes = self.get_panes_to_render();
         let focused = self.focused.is_some();
-        let pane_backgrounds_are_transparent = self.config.active_pane_opacity < 1.0
-            || self.config.inactive_pane_opacity < 1.0;
+        let pane_backgrounds_are_transparent =
+            self.config.active_pane_opacity < 1.0 || self.config.inactive_pane_opacity < 1.0;
         let window_is_transparent = !self.window_background.is_empty()
             || self.config.window_background_opacity != 1.0
             || pane_backgrounds_are_transparent;

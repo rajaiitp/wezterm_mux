@@ -13,6 +13,7 @@ members = [
   "wezterm-gui",
   "wezterm-mux-server",
   "wezterm-open-url",
+  "wezterm-session-state",
   "wezterm-ssh",
   "wezterm-surface",
   "wezterm-uds",
@@ -257,6 +258,7 @@ wezterm-open-url = { path = "wezterm-open-url" }
 wezterm-ssh = { path = "wezterm-ssh" }
 wezterm-surface = { path = "wezterm-surface" }
 wezterm-term = { path = "term" }
+wezterm-session-state = { path = "wezterm-session-state" }
 wezterm-toast-notification = { path = "wezterm-toast-notification" }
 wezterm-uds = { path = "wezterm-uds" }
 wezterm-version = { path = "wezterm-version" }

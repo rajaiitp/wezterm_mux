@@ -29,8 +29,10 @@ impl SaveStateCommand {
         }
         mux.tabs = tabs;
         mux.tab_titles = tab_titles;
-        mux.window_titles.retain(|window_id, _| retained_windows.contains(window_id));
-        mux.active_tabs.retain(|window_id, _| retained_windows.contains(window_id));
+        mux.window_titles
+            .retain(|window_id, _| retained_windows.contains(window_id));
+        mux.active_tabs
+            .retain(|window_id, _| retained_windows.contains(window_id));
 
         let snapshot = SessionSnapshot::new(mux);
         write_atomic(&path, &snapshot)?;

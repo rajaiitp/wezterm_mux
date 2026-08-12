@@ -1,18 +1,13 @@
 use anyhow::Context;
-use chrono::Utc;
 use codec::ListPanesResponse;
 use mux::Mux;
 use promise::spawn::spawn;
-use serde::Serialize;
 use smol::Timer;
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use wezterm_session_state::{self as session_state, SessionSnapshot};
 
 const DEFAULT_INTERVAL_SECONDS: u64 = 300;
 
@@ -25,25 +20,7 @@ fn enabled(name: &str, default: bool) -> bool {
 }
 
 fn state_path() -> anyhow::Result<PathBuf> {
-    let state_dir = if let Some(path) = env::var_os("XDG_STATE_HOME") {
-        PathBuf::from(path)
-    } else if cfg!(target_os = "macos") {
-        dirs_next::data_local_dir()
-            .context("could not determine the macOS application support directory")?
-    } else {
-        dirs_next::home_dir()
-            .context("could not determine the home directory")?
-            .join(".local")
-            .join("state")
-    };
-    Ok(state_dir.join("wezterm").join("herdr.json"))
-}
-
-#[derive(Debug, Serialize)]
-struct SessionSnapshot {
-    version: u32,
-    created_at: String,
-    mux: ListPanesResponse,
+    Ok(session_state::default_path()?)
 }
 
 fn executable() -> anyhow::Result<PathBuf> {
@@ -135,42 +112,6 @@ fn capture_mux() -> ListPanesResponse {
     }
 }
 
-fn write_atomic(path: &Path, snapshot: &SessionSnapshot) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating snapshot directory {}", parent.display()))?;
-    }
-    let data = serde_json::to_vec_pretty(snapshot).context("serializing session snapshot")?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temp_path = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&temp_path)
-        .with_context(|| format!("writing temporary snapshot {}", temp_path.display()))?;
-    file.write_all(&data)
-        .with_context(|| format!("writing temporary snapshot {}", temp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("syncing temporary snapshot {}", temp_path.display()))?;
-    drop(file);
-    if let Err(err) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err).with_context(|| {
-            format!(
-                "renaming temporary snapshot {} to {}",
-                temp_path.display(),
-                path.display()
-            )
-        });
-    }
-    Ok(())
-}
-
 pub fn save_now() -> anyhow::Result<()> {
     if !enabled("WEZTERM_HERDR_NATIVE_SESSION_AUTOSAVE", true) {
         return Ok(());
@@ -184,12 +125,8 @@ pub fn save_now() -> anyhow::Result<()> {
         log::debug!("native session save skipped because the mux is empty");
         return Ok(());
     }
-    let snapshot = SessionSnapshot {
-        version: 1,
-        created_at: Utc::now().to_rfc3339(),
-        mux,
-    };
-    write_atomic(&path, &snapshot)
+    let snapshot = SessionSnapshot::new(mux);
+    session_state::write_atomic(&path, &snapshot)
 }
 
 pub fn start_periodic_save() {

@@ -1,6 +1,6 @@
 import { createConnection, type Socket } from "node:net";
 
-type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+export type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
 
 type RpcResponse = {
   jsonrpc?: string;
@@ -18,8 +18,11 @@ type RpcNotification = {
 type Pending = {
   resolve: (value: Json) => void;
   reject: (error: Error) => void;
-  timer: NodeJS.Timeout;
+  timer: ReturnType<typeof setTimeout>;
 };
+
+const MAX_LINE_BYTES = 1024 * 1024;
+const MAX_BUFFER_BYTES = MAX_LINE_BYTES * 2;
 
 export type AutomationEvent = {
   event: string;
@@ -33,6 +36,7 @@ export type AutomationClientOptions = {
   clientName?: string;
   clientVersion?: string;
   onEvent?: (event: AutomationEvent) => void;
+  onResync?: (snapshot: Json) => void;
   onConnectionChange?: (connected: boolean, reason?: string) => void;
 };
 
@@ -43,6 +47,8 @@ export class AutomationClient {
   private pending = new Map<string, Pending>();
   private connectPromise?: Promise<void>;
   private closed = false;
+  private lastRevision = 0;
+  private connectionEpoch = 0;
 
   constructor(private readonly options: AutomationClientOptions) {}
 
@@ -58,6 +64,8 @@ export class AutomationClient {
       const socket = createConnection(this.options.socketPath);
       this.socket = socket;
       this.closed = false;
+      this.buffer = "";
+      const epoch = ++this.connectionEpoch;
       socket.setEncoding("utf8");
 
       const fail = (error: Error) => {
@@ -79,30 +87,43 @@ export class AutomationClient {
             },
             origin: this.options.paneId === undefined ? undefined : { paneId: this.options.paneId },
             requestedCapabilities: [
+              "topology.read",
               "pane.read",
+              "pane.focus",
               "pane.input.text",
               "pane.create",
-              "pane.layout",
-              "panel.manage",
+              "pane.close",
+              "workspace.control",
               "command.run",
               "command.cancel",
+              "command.input",
+              "command.close",
+              "client.callback",
             ],
           });
+          await this.request("topology.subscribe", {
+            sinceRevision: this.lastRevision || undefined,
+          });
           this.options.onConnectionChange?.(true);
-          this.connectPromise = undefined;
-          resolve();
+          if (this.connectionEpoch === epoch) {
+            this.connectPromise = undefined;
+            resolve();
+          }
         } catch (error) {
           fail(error instanceof Error ? error : new Error(String(error)));
           socket.destroy();
         }
       });
 
-      socket.on("data", (chunk: string) => this.consume(chunk));
-      socket.on("error", (error) => {
+      socket.on("data", (chunk: string) => {
+        if (this.connectionEpoch === epoch) this.consume(chunk);
+      });
+      socket.on("error", (error: Error) => {
         this.options.onConnectionChange?.(false, error.message);
         fail(error);
       });
       socket.on("close", () => {
+        if (this.connectionEpoch !== epoch) return;
         this.closed = true;
         this.socket = undefined;
         this.options.onConnectionChange?.(false, "connection closed");
@@ -117,6 +138,9 @@ export class AutomationClient {
     if (!this.socket || this.closed) throw new Error("WezTerm automation is not connected");
     const id = String(this.nextId++);
     const request = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    if (Buffer.byteLength(request) > MAX_LINE_BYTES) {
+      throw new Error(`WezTerm request is too large: ${method}`);
+    }
 
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -129,7 +153,7 @@ export class AutomationClient {
         reject,
         timer,
       });
-      this.socket!.write(`${request}\n`, (error) => {
+      this.socket!.write(`${request}\n`, (error?: Error | null) => {
         if (error) {
           clearTimeout(timer);
           this.pending.delete(id);
@@ -141,29 +165,50 @@ export class AutomationClient {
 
   disconnect(): void {
     this.closed = true;
+    this.connectionEpoch += 1;
     this.socket?.end();
     this.socket?.destroy();
     this.socket = undefined;
+    this.buffer = "";
+    this.connectPromise = undefined;
     this.failPending(new Error("WezTerm automation disconnected"));
   }
 
   private consume(chunk: string): void {
     this.buffer += chunk;
+    if (Buffer.byteLength(this.buffer) > MAX_BUFFER_BYTES) {
+      this.socket?.destroy(new Error("WezTerm automation receive buffer exceeded its limit"));
+      return;
+    }
     while (true) {
       const newline = this.buffer.indexOf("\n");
       if (newline < 0) return;
       const line = this.buffer.slice(0, newline);
       this.buffer = this.buffer.slice(newline + 1);
+      if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
+        this.socket?.destroy(new Error("WezTerm automation response is too large"));
+        return;
+      }
       if (!line.trim()) continue;
       let message: RpcResponse | RpcNotification;
       try {
         message = JSON.parse(line) as RpcResponse | RpcNotification;
-      } catch {
-        continue;
+      } catch (error) {
+        this.socket?.destroy(new Error(`Invalid WezTerm automation response: ${String(error)}`));
+        return;
       }
 
       if ("method" in message && message.method === "automation.event") {
-        this.options.onEvent?.(message.params as AutomationEvent);
+        const event = message.params as AutomationEvent;
+        if (event && typeof event.revision === "number") {
+          if (this.lastRevision && event.revision > this.lastRevision + 1) {
+            void this.request<Json>("topology.resync")
+              .then((snapshot) => this.options.onResync?.(snapshot))
+              .catch(() => undefined);
+          }
+          this.lastRevision = Math.max(this.lastRevision, event.revision);
+        }
+        this.options.onEvent?.(event);
         continue;
       }
       if (!("id" in message) || message.id === undefined) continue;

@@ -355,6 +355,7 @@ impl crate::TermWindow {
                 filled_box: TextureRect,
                 window_is_transparent: bool,
                 pane_background_opacity: f32,
+                pane_background: LinearRgba,
                 layers: &'a mut TripleLayerQuadAllocator<'b>,
                 error: Option<anyhow::Error>,
             }
@@ -386,6 +387,7 @@ impl crate::TermWindow {
                 filled_box,
                 window_is_transparent,
                 pane_background_opacity,
+                pane_background,
                 layers,
                 error: None,
             };
@@ -498,6 +500,7 @@ impl crate::TermWindow {
                         shape_generation: quad_key.shape_generation,
                         pane_background_opacity: NotNan::new(self.pane_background_opacity)
                             .expect("pane opacity must be finite"),
+                        pane_background: self.pane_background,
                         composing: if self.cursor.y == stable_row && self.pos.is_active {
                             if let DeadKeyStatus::Composing(composing) =
                                 &self.term_window.dead_key_status

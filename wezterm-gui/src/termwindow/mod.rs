@@ -1065,7 +1065,14 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::MouseEvent(event) => {
-                self.mouse_event_impl(event, window);
+                if let Some(modal) = self.get_modal() {
+                    modal.mouse_event(event, self)?;
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                } else {
+                    self.mouse_event_impl(event, window);
+                }
                 Ok(true)
             }
             WindowEvent::MouseLeave => {

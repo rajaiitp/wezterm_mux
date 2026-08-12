@@ -16,7 +16,7 @@ use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_main_thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -40,11 +40,17 @@ const MAX_TEXT_BYTES: usize = 256 * 1024;
 const MAIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MANAGED_PANES: usize = 3;
 const MAX_COMMAND_OUTPUT_LINES: usize = 4096;
+const MAX_RETAINED_COMMANDS: usize = 256;
+const COMMAND_RETENTION: Duration = Duration::from_secs(30 * 60);
+const MAX_CLIENTS: usize = 32;
+const MAX_SUBSCRIPTION_QUEUE: usize = 256;
 const PROMPT_MARKER_PREFIX: &str = "PI_WEZTERM_PROMPT_";
+const ERR_UNAUTHORIZED: i32 = -32003;
 
 #[derive(Clone, Debug)]
 struct ManagedCommand {
     pane_id: PaneId,
+    generation: u64,
     owner_client_id: Option<String>,
     running: bool,
     exit_code: Option<i32>,
@@ -55,6 +61,7 @@ struct ManagedCommand {
     output_start_x: usize,
     captured_output: Option<String>,
     output_truncated: bool,
+    finished_at: Option<std::time::Instant>,
 }
 
 struct ManagedShellSetup {
@@ -103,8 +110,11 @@ struct ConnectionState {
     authenticated: bool,
     client_id: Option<String>,
     origin_pane: Option<PaneId>,
+    capabilities: HashSet<String>,
     subscribed: bool,
+    #[allow(dead_code)]
     subscription_sender: Option<Arc<mpsc::SyncSender<String>>>,
+    peer_uid: Option<u32>,
 }
 
 impl Default for ConnectionState {
@@ -113,31 +123,140 @@ impl Default for ConnectionState {
             authenticated: false,
             client_id: None,
             origin_pane: None,
+            capabilities: HashSet::new(),
             subscribed: false,
+            peer_uid: None,
             subscription_sender: None,
         }
     }
 }
 
-lazy_static::lazy_static! {
-    static ref REVISION: AtomicU64 = AtomicU64::new(1);
-    static ref INSTANCE_ID: String = format!(
-        "{}-{}",
-        hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "localhost".to_string()),
-        std::process::id()
-    );
-    static ref CLIENTS: Mutex<HashMap<String, mpsc::SyncSender<String>>> = Mutex::new(HashMap::new());
-    static ref CLIENT_STATES: Mutex<HashMap<String, Value>> = Mutex::new(HashMap::new());
-    static ref CLIENT_ORIGINS: Mutex<HashMap<String, Option<PaneId>>> = Mutex::new(HashMap::new());
-    static ref MANAGED_PANES: Mutex<HashMap<PaneId, Vec<PaneId>>> = Mutex::new(HashMap::new());
-    static ref MANAGED_COMMANDS: Mutex<HashMap<String, ManagedCommand>> = Mutex::new(HashMap::new());
-    // A physical pane can be reused, but only its latest command ID may
-    // control it. Older IDs retain immutable output and status records.
-    static ref MANAGED_PANE_OWNERS: Mutex<HashMap<PaneId, String>> = Mutex::new(HashMap::new());
-    static ref PROMPT_MARKERS: (Mutex<HashMap<PaneId, u64>>, Condvar) =
-        (Mutex::new(HashMap::new()), Condvar::new());
-    static ref SHELL_READY: (Mutex<HashSet<PaneId>>, Condvar) = (Mutex::new(HashSet::new()), Condvar::new());
-    static ref SHELL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const AUTOMATION_SERVICE_NAME: &str = "wezterm.automation";
+
+#[derive(Debug, Clone)]
+pub struct AutomationInstance {
+    pub mux_instance_id: String,
+    pub epoch: u64,
+}
+
+/// All automation state belongs to the mux instance that owns the endpoint.
+/// This prevents a second mux created in the same process (tests, embedded
+/// frontends, or future multi-server setups) from sharing client and command
+/// identities accidentally.
+pub struct AutomationService {
+    instance: AutomationInstance,
+    revision: AtomicU64,
+    sequence: AtomicU64,
+    clients: Mutex<HashMap<String, mpsc::SyncSender<String>>>,
+    client_states: Mutex<HashMap<String, Value>>,
+    client_origins: Mutex<HashMap<String, Option<PaneId>>>,
+    event_history: Mutex<VecDeque<(u64, String)>>,
+    event_lock: Mutex<()>,
+    managed_panes: Mutex<HashMap<PaneId, Vec<PaneId>>>,
+    managed_commands: Mutex<HashMap<String, ManagedCommand>>,
+    managed_pane_owners: Mutex<HashMap<PaneId, String>>,
+    prompt_markers: (Mutex<HashMap<PaneId, u64>>, Condvar),
+    shell_ready: (Mutex<HashSet<PaneId>>, Condvar),
+    shell_sequence: AtomicU64,
+    callback_results: Mutex<HashMap<String, mpsc::Sender<Value>>>,
+    object_generations: Mutex<HashMap<(String, u64), u64>>,
+    subscribed_clients: Mutex<HashSet<String>>,
+    event_bridge_started: std::sync::atomic::AtomicBool,
+}
+
+impl AutomationService {
+    fn new() -> Self {
+        Self {
+            instance: AutomationInstance {
+                mux_instance_id: format!(
+                    "{}-{}",
+                    hostname::get()
+                        .ok()
+                        .and_then(|h| h.into_string().ok())
+                        .unwrap_or_else(|| "localhost".to_string()),
+                    std::process::id()
+                ),
+                epoch: std::process::id() as u64,
+            },
+            revision: AtomicU64::new(1),
+            sequence: AtomicU64::new(1),
+            clients: Mutex::new(HashMap::new()),
+            client_states: Mutex::new(HashMap::new()),
+            client_origins: Mutex::new(HashMap::new()),
+            event_history: Mutex::new(VecDeque::new()),
+            event_lock: Mutex::new(()),
+            managed_panes: Mutex::new(HashMap::new()),
+            managed_commands: Mutex::new(HashMap::new()),
+            managed_pane_owners: Mutex::new(HashMap::new()),
+            prompt_markers: (Mutex::new(HashMap::new()), Condvar::new()),
+            shell_ready: (Mutex::new(HashSet::new()), Condvar::new()),
+            shell_sequence: AtomicU64::new(1),
+            callback_results: Mutex::new(HashMap::new()),
+            object_generations: Mutex::new(HashMap::new()),
+            subscribed_clients: Mutex::new(HashSet::new()),
+            event_bridge_started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+fn automation_service() -> Arc<AutomationService> {
+    let service = Mux::get().get_or_register_service(AUTOMATION_SERVICE_NAME, || {
+        Arc::new(AutomationService::new())
+    });
+    if !service
+        .event_bridge_started
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        let bridge_service = Arc::clone(&service);
+        Mux::get().subscribe(move |notification| {
+            let _event_guard = bridge_service.event_lock.lock().unwrap();
+            let revision = bridge_service.revision.fetch_add(1, Ordering::Relaxed);
+            let event = notification_to_event(notification, revision);
+            let Ok(line) = serde_json::to_string(&event) else {
+                return false;
+            };
+            remember_event_for(&bridge_service, revision, line.clone());
+            let subscribed = bridge_service.subscribed_clients.lock().unwrap().clone();
+            let clients = bridge_service
+                .clients
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(client_id, _)| subscribed.contains(*client_id))
+                .map(|(client_id, sender)| (client_id.clone(), sender.clone()))
+                .collect::<Vec<_>>();
+            let mut stale = Vec::new();
+            for (client_id, sender) in clients {
+                if sender.try_send(line.clone()).is_err() {
+                    stale.push(client_id);
+                }
+            }
+            if !stale.is_empty() {
+                let mut clients = bridge_service.clients.lock().unwrap();
+                let mut subscriptions = bridge_service.subscribed_clients.lock().unwrap();
+                for client_id in stale {
+                    clients.remove(&client_id);
+                    subscriptions.remove(&client_id);
+                }
+            }
+            true
+        });
+    }
+    service
+}
+
+pub fn instance() -> AutomationInstance {
+    automation_service().instance.clone()
+}
+
+fn next_sequence() -> u64 {
+    automation_service()
+        .sequence
+        .fetch_add(1, Ordering::Relaxed)
+}
+
+fn service_revision() -> u64 {
+    automation_service().revision.load(Ordering::Relaxed)
 }
 
 /// Derive a sibling endpoint from the configured mux socket.
@@ -181,8 +300,9 @@ pub fn spawn_listener(unix_domain: &UnixDomain) -> anyhow::Result<PathBuf> {
                             thread::Builder::new()
                                 .name("wezterm-automation-client".to_string())
                                 .spawn(move || {
+                                    let peer_uid = peer_uid(&stream);
                                     let stream = UnixStream::from_std(stream);
-                                    if let Err(err) = handle_connection(stream) {
+                                    if let Err(err) = handle_connection(stream, peer_uid) {
                                         log::debug!("automation client ended: {err:#}");
                                     }
                                 })
@@ -225,11 +345,31 @@ impl UnixStreamExt for UnixStream {
 }
 
 #[cfg(unix)]
-fn handle_connection(stream: UnixStream) -> anyhow::Result<()> {
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    (result == 0).then_some(credentials.uid)
+}
+
+#[cfg(unix)]
+fn handle_connection(stream: UnixStream, peer_uid: Option<u32>) -> anyhow::Result<()> {
     use std::os::unix::net::UnixStream as StdUnixStream;
 
     let writer_stream: StdUnixStream = stream.try_clone()?;
-    let (out_tx, out_rx) = mpsc::sync_channel::<String>(256);
+    let (out_tx, out_rx) = mpsc::sync_channel::<String>(MAX_SUBSCRIPTION_QUEUE);
     let writer = thread::Builder::new()
         .name("wezterm-automation-writer".to_string())
         .spawn(move || {
@@ -245,7 +385,10 @@ fn handle_connection(stream: UnixStream) -> anyhow::Result<()> {
         })?;
 
     let mut reader = BufReader::new(stream);
-    let mut state = ConnectionState::default();
+    let mut state = ConnectionState {
+        peer_uid,
+        ..ConnectionState::default()
+    };
     let mut line = Vec::new();
 
     loop {
@@ -289,9 +432,7 @@ fn handle_connection(stream: UnixStream) -> anyhow::Result<()> {
     }
 
     if let Some(client_id) = state.client_id {
-        CLIENTS.lock().unwrap().remove(&client_id);
-        CLIENT_STATES.lock().unwrap().remove(&client_id);
-        CLIENT_ORIGINS.lock().unwrap().remove(&client_id);
+        disconnect_client(&client_id);
     }
     drop(out_tx);
     writer.join().ok();
@@ -299,7 +440,7 @@ fn handle_connection(stream: UnixStream) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn handle_connection(_stream: UnixStream) -> anyhow::Result<()> {
+fn handle_connection(_stream: UnixStream, _peer_uid: Option<u32>) -> anyhow::Result<()> {
     anyhow::bail!("the native automation endpoint is not implemented on this platform")
 }
 
@@ -316,6 +457,19 @@ fn dispatch_request(
 
     if request.method == "automation.hello" {
         let params = object_params(request.params)?;
+        if state
+            .peer_uid
+            .is_some_and(|uid| uid != unsafe { libc::getuid() })
+        {
+            send_error(
+                out,
+                id,
+                ERR_UNAUTHORIZED,
+                "automation socket peer is not the current user",
+                None,
+            );
+            return Ok(());
+        }
         let requested_version = params
             .get("protocolVersion")
             .and_then(Value::as_u64)
@@ -337,31 +491,40 @@ fn dispatch_request(
             .and_then(|client| client.get("name"))
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        let client_id = format!(
-            "{}:{}:{}",
-            client,
-            std::process::id(),
-            REVISION.fetch_add(1, Ordering::Relaxed)
+        anyhow::ensure!(
+            !state.authenticated,
+            "automation.hello may only be called once"
         );
+        anyhow::ensure!(
+            automation_service().clients.lock().unwrap().len() < MAX_CLIENTS,
+            "automation client limit reached"
+        );
+        let client_id = format!("{}:{}:{}", client, std::process::id(), next_sequence());
         let origin_pane = params
             .get("origin")
             .and_then(Value::as_object)
             .and_then(|origin| origin.get("paneId"))
-            .and_then(Value::as_u64)
-            .map(|id| id as PaneId);
+            .map(|value| ref_id(value, "pane").map(|id| id as PaneId))
+            .transpose()?;
 
+        let granted = granted_capabilities(&params);
         state.authenticated = true;
         state.client_id = Some(client_id.clone());
         state.origin_pane = origin_pane;
-        CLIENTS
+        state.capabilities = granted.iter().cloned().collect();
+        let service = automation_service();
+        service
+            .clients
             .lock()
             .unwrap()
             .insert(client_id.clone(), out.clone());
-        CLIENT_STATES
+        service
+            .client_states
             .lock()
             .unwrap()
             .insert(client_id.clone(), json!({ "phase": "connected" }));
-        CLIENT_ORIGINS
+        service
+            .client_origins
             .lock()
             .unwrap()
             .insert(client_id.clone(), origin_pane);
@@ -377,11 +540,11 @@ fn dispatch_request(
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "connectionId": client_id,
-                "muxInstanceId": &*INSTANCE_ID,
-                "epoch": std::process::id(),
+                "muxInstanceId": instance().mux_instance_id,
+                "epoch": instance().epoch,
                 "originPaneId": origin_pane,
                 "managedPanel": managed_panel,
-                "grantedCapabilities": capabilities(),
+                "grantedCapabilities": granted,
                 "features": {
                     "topologySnapshot": true,
                     "topologySubscription": true,
@@ -395,7 +558,7 @@ fn dispatch_request(
                     "sshDomains": true,
                     "sshRelay": "native-mux-domain"
                 },
-                "revision": REVISION.load(Ordering::Relaxed)
+                "revision": service_revision()
             }),
         );
         return Ok(());
@@ -406,17 +569,38 @@ fn dispatch_request(
         return Ok(());
     }
 
+    if let Some(capability) = required_capability(&request.method) {
+        if let Err(err) = authorize(state, capability) {
+            send_error(
+                out,
+                id,
+                ERR_UNAUTHORIZED,
+                &err.to_string(),
+                Some(json!({ "capability": capability })),
+            );
+            return Ok(());
+        }
+    }
+
     match request.method.as_str() {
         "context.get" => send_result(out, id, context_snapshot(state.origin_pane)?),
         "topology.snapshot" => send_result(out, id, topology_snapshot()?),
         "topology.subscribe" => {
-            subscribe_topology(out.clone(), state)?;
+            let params = object_params(request.params)?;
+            let since = params.get("sinceRevision").and_then(Value::as_u64);
+            let replay = subscribe_topology(out.clone(), state, since)?;
             send_result(
                 out,
                 id,
-                json!({ "subscribed": true, "revision": current_revision() }),
+                json!({
+                    "subscribed": true,
+                    "revision": current_revision(),
+                    "replayed": replay.replayed,
+                    "resyncRequired": replay.resync_required,
+                }),
             );
         }
+        "topology.resync" => send_result(out, id, topology_snapshot()?),
         "pane.get" => {
             let params = object_params(request.params)?;
             let pane_id = pane_id(&params)?;
@@ -435,13 +619,16 @@ fn dispatch_request(
             send_result(out, id, semantic_zones(pane_id)?)
         }
         "client.list" => {
-            let clients = CLIENTS
+            let service = automation_service();
+            let clients = service
+                .clients
                 .lock()
                 .unwrap()
                 .keys()
                 .cloned()
                 .map(|client_id| {
-                    let state = CLIENT_STATES
+                    let state = service
+                        .client_states
                         .lock()
                         .unwrap()
                         .get(&client_id)
@@ -458,7 +645,11 @@ fn dispatch_request(
                 .client_id
                 .clone()
                 .ok_or_else(|| anyhow!("client is not registered"))?;
-            CLIENT_STATES.lock().unwrap().insert(client_id, params);
+            automation_service()
+                .client_states
+                .lock()
+                .unwrap()
+                .insert(client_id, params);
             send_result(out, id, json!({ "updated": true }))
         }
         "client.call" => {
@@ -470,10 +661,12 @@ fn dispatch_request(
             let target = if target == "origin-pane" {
                 let origin_pane = params
                     .get("originPaneId")
-                    .and_then(Value::as_u64)
+                    .map(|value| ref_id(value, "pane"))
+                    .transpose()?
                     .ok_or_else(|| anyhow!("originPaneId is required for origin-pane"))?
                     as PaneId;
-                CLIENT_ORIGINS
+                automation_service()
+                    .client_origins
                     .lock()
                     .unwrap()
                     .iter()
@@ -490,8 +683,19 @@ fn dispatch_request(
                 .get("method")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("method is required"))?;
-            let callback_id = format!("callback:{}", REVISION.fetch_add(1, Ordering::Relaxed));
-            let target_tx = CLIENTS
+            let callback_id = format!("callback:{}", next_sequence());
+            anyhow::ensure!(
+                target != state.client_id.as_deref().unwrap_or_default(),
+                "client.call target must be another client"
+            );
+            let (callback_tx, callback_rx) = mpsc::channel();
+            automation_service()
+                .callback_results
+                .lock()
+                .unwrap()
+                .insert(callback_id.clone(), callback_tx);
+            let target_tx = automation_service()
+                .clients
                 .lock()
                 .unwrap()
                 .get(&target)
@@ -508,14 +712,31 @@ fn dispatch_request(
                 }),
             };
             let line = serde_json::to_string(&notification)?;
-            target_tx
-                .try_send(line)
-                .map_err(|_| anyhow!("target client output queue is full"))?;
-            send_result(
-                out,
-                id,
-                json!({ "accepted": true, "callbackId": callback_id }),
-            )
+            if let Err(error) = target_tx.try_send(line) {
+                automation_service()
+                    .callback_results
+                    .lock()
+                    .unwrap()
+                    .remove(&callback_id);
+                return Err(anyhow!("target client output queue is full: {error}"));
+            }
+            match callback_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(value) => send_result(out, id, value),
+                Err(_) => {
+                    automation_service()
+                        .callback_results
+                        .lock()
+                        .unwrap()
+                        .remove(&callback_id);
+                    send_error(
+                        out,
+                        id,
+                        -32011,
+                        "client callback timed out",
+                        Some(json!({ "callbackId": callback_id })),
+                    )
+                }
+            }
         }
         "pane.sendText" | "pane.focus" | "pane.close" | "pane.setZoomed" | "pane.split"
         | "command.run" | "command.cancel" | "command.input" | "command.close" | "panel.ensure"
@@ -539,13 +760,20 @@ fn dispatch_request(
         }
         "command.read" => {
             let params = object_params(request.params)?;
-            let command_id = managed_command_id(&params)?;
-            let record = MANAGED_COMMANDS
+            let (command_id, generation) = managed_command_ref(&params)?;
+            let record = automation_service()
+                .managed_commands
                 .lock()
                 .unwrap()
                 .get(&command_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("command {command_id} not found"))?;
+            if let Some(generation) = generation {
+                anyhow::ensure!(
+                    generation == record.generation,
+                    "STALE_OBJECT: command generation has changed"
+                );
+            }
             let start = params.get("start").and_then(Value::as_i64);
             let end = params.get("end").and_then(Value::as_i64);
             let (output, range_start, range_end, truncated) =
@@ -565,16 +793,44 @@ fn dispatch_request(
         }
         "command.getResult" => {
             let params = object_params(request.params)?;
-            let command_id = managed_command_id(&params)?;
-            let record = MANAGED_COMMANDS
+            let (command_id, generation) = managed_command_ref(&params)?;
+            let record = automation_service()
+                .managed_commands
                 .lock()
                 .unwrap()
                 .get(&command_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("command {command_id} not found"))?;
+            if let Some(generation) = generation {
+                anyhow::ensure!(
+                    generation == record.generation,
+                    "STALE_OBJECT: command generation has changed"
+                );
+            }
             send_result(out, id, managed_command_result(&command_id, &record))
         }
-        "client.callback_result" => {}
+        "client.callback_result" => {
+            let params = object_params(request.params)?;
+            let callback_id = params
+                .get("callbackId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("callbackId is required"))?;
+            let result = params.get("result").cloned().unwrap_or(Value::Null);
+            let error = params.get("error").cloned();
+            if let Some(waiter) = automation_service()
+                .callback_results
+                .lock()
+                .unwrap()
+                .remove(callback_id)
+            {
+                let _ = waiter.send(json!({ "result": result, "error": error }));
+            }
+            send_result(
+                out,
+                id,
+                json!({ "callbackId": callback_id, "accepted": true }),
+            );
+        }
         "automation.ping" => send_result(
             out,
             id,
@@ -613,6 +869,139 @@ fn capabilities() -> Vec<&'static str> {
     ]
 }
 
+fn granted_capabilities(params: &Map<String, Value>) -> Vec<String> {
+    let requested = params
+        .get("requestedCapabilities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<HashSet<_>>();
+    let available = capabilities();
+    if requested.is_empty() {
+        return available.into_iter().map(str::to_string).collect();
+    }
+    available
+        .into_iter()
+        .filter(|capability| requested.contains(capability))
+        .map(str::to_string)
+        .collect()
+}
+
+fn required_capability(method: &str) -> Option<&'static str> {
+    Some(match method {
+        "context.get"
+        | "topology.snapshot"
+        | "topology.subscribe"
+        | "pane.get"
+        | "pane.readText"
+        | "pane.getSemanticZones"
+        | "client.list"
+        | "automation.ping"
+        | "command.read"
+        | "command.getResult" => "topology.read",
+        "pane.sendText" | "command.input" => "pane.input.text",
+        "pane.focus" | "tab.focus" => "pane.focus",
+        "pane.close" | "command.close" => "pane.close",
+        "pane.split" | "panel.ensure" | "command.run" => "pane.create",
+        "command.cancel" => "command.cancel",
+        "workspace.rename" => "workspace.control",
+        "client.call" | "client.callback_result" => "client.callback",
+        _ => return None,
+    })
+}
+
+fn authorize(state: &ConnectionState, capability: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        state.capabilities.contains(capability) || state.capabilities.contains("*"),
+        "capability {capability} was not granted"
+    );
+    Ok(())
+}
+
+fn disconnect_client(client_id: &str) {
+    automation_service()
+        .clients
+        .lock()
+        .unwrap()
+        .remove(client_id);
+    automation_service()
+        .client_states
+        .lock()
+        .unwrap()
+        .remove(client_id);
+    automation_service()
+        .client_origins
+        .lock()
+        .unwrap()
+        .remove(client_id);
+    automation_service()
+        .subscribed_clients
+        .lock()
+        .unwrap()
+        .remove(client_id);
+    let owned = automation_service()
+        .managed_commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(id, command)| {
+            (command.owner_client_id.as_deref() == Some(client_id) && command.running)
+                .then_some(id.clone())
+        })
+        .collect::<Vec<_>>();
+    for command_id in owned {
+        let record = automation_service()
+            .managed_commands
+            .lock()
+            .unwrap()
+            .get(&command_id)
+            .cloned();
+        if let Some(record) = record {
+            if let Some(pane) = Mux::get().get_pane(record.pane_id) {
+                let _ = send_user_input(pane.as_ref(), "\u{3}");
+            }
+        }
+        finish_command(
+            &command_id,
+            None,
+            None,
+            Some(false),
+            Some("client-disconnected"),
+        );
+    }
+}
+
+fn reap_managed_commands() {
+    let now = std::time::Instant::now();
+    let service = automation_service();
+    let mut commands = service.managed_commands.lock().unwrap();
+    let mut removable = commands
+        .iter()
+        .filter_map(|(id, command)| {
+            (!command.running
+                && command
+                    .finished_at
+                    .is_some_and(|finished| now.duration_since(finished) >= COMMAND_RETENTION))
+            .then_some(id.clone())
+        })
+        .collect::<Vec<_>>();
+    while commands.len().saturating_sub(removable.len()) > MAX_RETAINED_COMMANDS {
+        let candidate = commands
+            .iter()
+            .filter(|(id, command)| !command.running && !removable.contains(id))
+            .min_by_key(|(_, command)| command.finished_at)
+            .map(|(id, _)| id.clone());
+        let Some(candidate) = candidate else { break };
+        removable.push(candidate);
+    }
+    for id in removable {
+        if let Some(command) = commands.remove(&id) {
+            clear_command_pane_owner(&id, command.pane_id);
+        }
+    }
+}
+
 fn object_params(params: Option<Value>) -> anyhow::Result<Map<String, Value>> {
     match params.unwrap_or_else(|| json!({})) {
         Value::Object(value) => Ok(value),
@@ -620,12 +1009,118 @@ fn object_params(params: Option<Value>) -> anyhow::Result<Map<String, Value>> {
     }
 }
 
-fn pane_id(params: &Map<String, Value>) -> anyhow::Result<PaneId> {
-    params
-        .get("paneId")
+fn object_generation(kind: &str, id: u64) -> u64 {
+    let service = automation_service();
+    let mut generations = service.object_generations.lock().unwrap();
+    *generations.entry((kind.to_string(), id)).or_insert(1)
+}
+
+fn bump_object_generation(kind: &str, id: u64) {
+    let service = automation_service();
+    let mut generations = service.object_generations.lock().unwrap();
+    let generation = generations.entry((kind.to_string(), id)).or_insert(1);
+    *generation = generation.saturating_add(1);
+}
+
+fn object_ref(kind: &str, id: u64) -> Value {
+    object_ref_with_generation(kind, id, Some(object_generation(kind, id)))
+}
+
+fn object_ref_with_generation(kind: &str, id: u64, generation: Option<u64>) -> Value {
+    let instance = instance();
+    let mut value = json!({
+        "muxInstanceId": instance.mux_instance_id,
+        "epoch": instance.epoch,
+        "kind": kind,
+        "id": id,
+    });
+    if let Some(generation) = generation {
+        value["generation"] = json!(generation);
+    }
+    value
+}
+
+fn ref_id(value: &Value, kind: &str) -> anyhow::Result<u64> {
+    if let Some(id) = value.as_u64() {
+        // Numeric IDs remain accepted during the compatibility window.
+        return Ok(id);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{kind} reference must be an object or numeric ID"))?;
+    let expected = instance();
+    anyhow::ensure!(
+        object.get("kind").and_then(Value::as_str) == Some(kind),
+        "reference kind does not match {kind}"
+    );
+    anyhow::ensure!(
+        object.get("muxInstanceId").and_then(Value::as_str)
+            == Some(expected.mux_instance_id.as_str()),
+        "reference belongs to another mux instance"
+    );
+    anyhow::ensure!(
+        object.get("epoch").and_then(Value::as_u64) == Some(expected.epoch),
+        "reference belongs to another mux epoch"
+    );
+    if let Some(generation) = object.get("generation").and_then(Value::as_u64) {
+        anyhow::ensure!(
+            generation
+                == object_generation(
+                    kind,
+                    object
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| anyhow!("{kind} reference id is required"))?
+                ),
+            "STALE_OBJECT: {kind} generation has changed"
+        );
+    }
+    object
+        .get("id")
         .and_then(Value::as_u64)
-        .map(|id| id as PaneId)
-        .ok_or_else(|| anyhow!("paneId is required"))
+        .ok_or_else(|| anyhow!("{kind} reference id is required"))
+}
+
+fn ref_param(params: &Map<String, Value>, key: &str, kind: &str) -> anyhow::Result<u64> {
+    params
+        .get(key)
+        .ok_or_else(|| anyhow!("{key} is required"))
+        .and_then(|value| ref_id(value, kind))
+}
+
+fn pane_id(params: &Map<String, Value>) -> anyhow::Result<PaneId> {
+    Ok(ref_param(params, "paneId", "pane")? as PaneId)
+}
+
+fn managed_command_ref(params: &Map<String, Value>) -> anyhow::Result<(String, Option<u64>)> {
+    if let Some(value) = params.get("commandRef") {
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow!("commandRef must be an object"))?;
+        anyhow::ensure!(
+            object.get("kind").and_then(Value::as_str) == Some("command"),
+            "reference kind does not match command"
+        );
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("command reference id is required"))?;
+        let expected = instance();
+        anyhow::ensure!(
+            object.get("muxInstanceId").and_then(Value::as_str)
+                == Some(expected.mux_instance_id.as_str()),
+            "reference belongs to another mux instance"
+        );
+        anyhow::ensure!(
+            object.get("epoch").and_then(Value::as_u64) == Some(expected.epoch),
+            "reference belongs to another mux epoch"
+        );
+        return Ok((
+            id.to_string(),
+            object.get("generation").and_then(Value::as_u64),
+        ));
+    }
+    managed_command_id(params).map(|id| (id, None))
 }
 
 fn managed_command_id(params: &Map<String, Value>) -> anyhow::Result<String> {
@@ -634,10 +1129,11 @@ fn managed_command_id(params: &Map<String, Value>) -> anyhow::Result<String> {
     }
     let pane_id = params
         .get("paneId")
-        .and_then(Value::as_u64)
-        .map(|id| id as PaneId)
+        .map(|value| ref_id(value, "pane").map(|id| id as PaneId))
+        .transpose()?
         .ok_or_else(|| anyhow!("commandId or paneId is required"))?;
-    MANAGED_COMMANDS
+    automation_service()
+        .managed_commands
         .lock()
         .unwrap()
         .iter()
@@ -646,9 +1142,21 @@ fn managed_command_id(params: &Map<String, Value>) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow!("no running command is attached to pane {pane_id}"))
 }
 
+fn command_ref(command_id: &str, generation: u64) -> Value {
+    let instance = instance();
+    json!({
+        "muxInstanceId": instance.mux_instance_id,
+        "epoch": instance.epoch,
+        "kind": "command",
+        "id": command_id,
+        "generation": generation,
+    })
+}
+
 fn managed_command_result(command_id: &str, command: &ManagedCommand) -> Value {
     json!({
         "commandId": command_id,
+        "commandRef": command_ref(command_id, command.generation),
         "running": command.running,
         "exitCode": command.exit_code,
         "signal": command.signal,
@@ -658,7 +1166,8 @@ fn managed_command_result(command_id: &str, command: &ManagedCommand) -> Value {
 }
 
 fn ensure_command_owns_pane(command_id: &str, command: &ManagedCommand) -> anyhow::Result<()> {
-    let owners = MANAGED_PANE_OWNERS.lock().unwrap();
+    let service = automation_service();
+    let owners = service.managed_pane_owners.lock().unwrap();
     anyhow::ensure!(
         owners
             .get(&command.pane_id)
@@ -669,12 +1178,14 @@ fn ensure_command_owns_pane(command_id: &str, command: &ManagedCommand) -> anyho
 }
 
 fn clear_command_pane_owner(command_id: &str, pane_id: PaneId) {
-    let mut owners = MANAGED_PANE_OWNERS.lock().unwrap();
+    let service = automation_service();
+    let mut owners = service.managed_pane_owners.lock().unwrap();
     if owners
         .get(&pane_id)
         .is_some_and(|owner| owner == command_id)
     {
         owners.remove(&pane_id);
+        bump_object_generation("pane", pane_id as u64);
     }
 }
 
@@ -713,35 +1224,63 @@ fn send_error(
 }
 
 fn current_revision() -> u64 {
-    REVISION.load(Ordering::Relaxed)
+    service_revision()
+}
+
+struct SubscriptionResult {
+    replayed: usize,
+    resync_required: bool,
 }
 
 fn subscribe_topology(
     out: mpsc::SyncSender<String>,
     state: &mut ConnectionState,
-) -> anyhow::Result<()> {
+    since: Option<u64>,
+) -> anyhow::Result<SubscriptionResult> {
     if state.subscribed {
-        return Ok(());
+        return Ok(SubscriptionResult {
+            replayed: 0,
+            resync_required: false,
+        });
+    }
+    let mut replayed = 0;
+    let mut resync_required = false;
+    let service = automation_service();
+    let _event_guard = service.event_lock.lock().unwrap();
+    if let Some(since) = since {
+        let history = service.event_history.lock().unwrap();
+        let oldest = history.front().map(|(revision, _)| *revision);
+        resync_required = oldest.is_some_and(|oldest| since.saturating_add(1) < oldest);
+        if !resync_required {
+            for (revision, line) in history.iter().filter(|(revision, _)| *revision > since) {
+                if out.try_send(line.clone()).is_err() {
+                    break;
+                }
+                let _ = revision;
+                replayed += 1;
+            }
+        }
     }
     state.subscribed = true;
-    // The mux subscriber keeps a weak sender so disconnecting a client can
-    // release its writer thread immediately, even if the mux is idle and no
-    // later notification arrives to prune the subscriber.
-    let sender = Arc::new(out);
-    let weak_sender = Arc::downgrade(&sender);
-    state.subscription_sender = Some(sender);
-    Mux::get().subscribe(move |notification| {
-        let Some(sender) = weak_sender.upgrade() else {
-            return false;
-        };
-        let revision = REVISION.fetch_add(1, Ordering::Relaxed) + 1;
-        let event = notification_to_event(notification, revision);
-        let Ok(line) = serde_json::to_string(&event) else {
-            return false;
-        };
-        sender.try_send(line).is_ok()
-    });
-    Ok(())
+    if let Some(client_id) = state.client_id.as_ref() {
+        automation_service()
+            .subscribed_clients
+            .lock()
+            .unwrap()
+            .insert(client_id.clone());
+    }
+    Ok(SubscriptionResult {
+        replayed,
+        resync_required,
+    })
+}
+
+fn remember_event_for(service: &AutomationService, revision: u64, line: String) {
+    let mut history = service.event_history.lock().unwrap();
+    history.push_back((revision, line));
+    while history.len() > 1024 {
+        history.pop_front();
+    }
 }
 
 fn notification_to_event(notification: MuxNotification, revision: u64) -> EventNotification {
@@ -850,6 +1389,7 @@ fn topology_snapshot() -> anyhow::Result<Value> {
                     .collect::<Vec<_>>();
                 json!({
                     "tabId": tab.tab_id(),
+                    "tabRef": object_ref("tab", tab.tab_id() as u64),
                     "index": index,
                     "active": index == window.get_active_idx(),
                     "title": tab.get_title(),
@@ -860,6 +1400,7 @@ fn topology_snapshot() -> anyhow::Result<Value> {
             .collect::<Vec<_>>();
         windows.push(json!({
             "windowId": window_id,
+            "windowRef": object_ref("window", window_id as u64),
             "workspace": window.get_workspace(),
             "title": window.get_title(),
             "activeTabIndex": window.get_active_idx(),
@@ -868,8 +1409,8 @@ fn topology_snapshot() -> anyhow::Result<Value> {
     }
 
     Ok(json!({
-        "muxInstanceId": &*INSTANCE_ID,
-        "epoch": std::process::id(),
+        "muxInstanceId": instance().mux_instance_id,
+        "epoch": instance().epoch,
         "revision": current_revision(),
         "activeWorkspace": mux.active_workspace(),
         "workspaces": mux.iter_workspaces(),
@@ -886,8 +1427,11 @@ fn pane_position_snapshot(
     let pane = position.pane;
     json!({
         "paneId": pane.pane_id(),
+        "paneRef": object_ref("pane", pane.pane_id() as u64),
         "windowId": window_id,
+        "windowRef": object_ref("window", window_id as u64),
         "tabId": tab_id,
+        "tabRef": object_ref("tab", tab_id as u64),
         "domainId": pane.domain_id(),
         "active": position.is_active,
         "zoomed": position.is_zoomed,
@@ -913,8 +1457,11 @@ fn pane_snapshot(pane_id: PaneId) -> anyhow::Result<Value> {
     let dims = pane.get_dimensions();
     Ok(json!({
         "paneId": pane_id,
+        "paneRef": object_ref("pane", pane_id as u64),
         "windowId": window_id,
+        "windowRef": object_ref("window", window_id as u64),
         "tabId": tab_id,
+        "tabRef": object_ref("tab", tab_id as u64),
         "domainId": domain_id,
         "title": pane.get_title(),
         "cwd": pane.get_current_working_dir(CachePolicy::AllowStale).map(|url| url.to_string()),
@@ -1176,7 +1723,8 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
         }
         "command.cancel" => {
             let command_id = managed_command_id(&params)?;
-            let record = MANAGED_COMMANDS
+            let record = automation_service()
+                .managed_commands
                 .lock()
                 .unwrap()
                 .get(&command_id)
@@ -1208,7 +1756,8 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("text is required"))?;
             anyhow::ensure!(text.len() <= MAX_TEXT_BYTES, "input is too large");
-            let record = MANAGED_COMMANDS
+            let record = automation_service()
+                .managed_commands
                 .lock()
                 .unwrap()
                 .get(&command_id)
@@ -1224,7 +1773,8 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
         }
         "command.close" => {
             let command_id = managed_command_id(&params)?;
-            let record = MANAGED_COMMANDS
+            let record = automation_service()
+                .managed_commands
                 .lock()
                 .unwrap()
                 .get(&command_id)
@@ -1272,10 +1822,7 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
             Ok(json!({ "old": old, "new": new }))
         }
         "tab.focus" => {
-            let tab_id = params
-                .get("tabId")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| anyhow!("tabId is required"))? as TabId;
+            let tab_id = ref_param(&params, "tabId", "tab")? as TabId;
             let window_id = mux
                 .window_containing_tab(tab_id)
                 .ok_or_else(|| anyhow!("tab {tab_id} not found"))?;
@@ -1328,11 +1875,7 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
             Ok(json!({ "paneId": pane.pane_id() }))
         }
         "panel.ensure" => {
-            let origin_pane_id = params
-                .get("paneId")
-                .and_then(Value::as_u64)
-                .map(|id| id as PaneId)
-                .ok_or_else(|| anyhow!("paneId is required for a managed panel"))?;
+            let origin_pane_id = ref_param(&params, "paneId", "pane")? as PaneId;
             let cwd = params.get("cwd").and_then(Value::as_str);
             let (pane, reused, pool_size) = ensure_managed_pane(origin_pane_id, cwd).await?;
             let (window_id, tab_id) = mux
@@ -1359,21 +1902,20 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 .get("cwd")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let origin_pane_id = params
-                .get("paneId")
-                .and_then(Value::as_u64)
-                .map(|id| id as PaneId)
-                .ok_or_else(|| anyhow!("paneId is required for a managed command"))?;
+            let origin_pane_id = ref_param(&params, "paneId", "pane")? as PaneId;
 
             let (pane, reused, pool_size) =
                 ensure_managed_pane(origin_pane_id, cwd.as_deref()).await?;
 
-            let sequence = REVISION.fetch_add(1, Ordering::Relaxed);
+            let sequence = next_sequence();
             let command_id = format!("command-{sequence}");
             let script = managed_command_script(command, cwd.as_deref())?;
             let output_start = pane.get_cursor_position();
             let record = ManagedCommand {
                 pane_id: pane.pane_id(),
+                generation: automation_service()
+                    .shell_sequence
+                    .fetch_add(1, Ordering::Relaxed),
                 owner_client_id: params
                     .get("ownerClientId")
                     .and_then(Value::as_str)
@@ -1387,18 +1929,26 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 output_start_x: output_start.x,
                 captured_output: None,
                 output_truncated: false,
+                finished_at: None,
             };
-            MANAGED_COMMANDS
+            let generation = record.generation;
+            automation_service()
+                .managed_commands
                 .lock()
                 .unwrap()
                 .insert(command_id.clone(), record);
-            MANAGED_PANE_OWNERS
+            automation_service()
+                .managed_pane_owners
                 .lock()
                 .unwrap()
                 .insert(pane.pane_id(), command_id.clone());
             watch_command(command_id.clone(), pane.pane_id());
             if let Err(error) = send_user_input(pane.as_ref(), &script) {
-                MANAGED_COMMANDS.lock().unwrap().remove(&command_id);
+                automation_service()
+                    .managed_commands
+                    .lock()
+                    .unwrap()
+                    .remove(&command_id);
                 clear_command_pane_owner(&command_id, pane.pane_id());
                 return Err(error.into());
             }
@@ -1409,7 +1959,9 @@ async fn handle_mutation(method: &str, params: Value) -> anyhow::Result<Value> {
                 .ok_or_else(|| anyhow!("managed pane is not attached to a tab"))?;
             Ok(json!({
                 "commandId": command_id,
+                "commandRef": command_ref(&command_id, generation),
                 "paneId": pane.pane_id(),
+                "paneRef": object_ref("pane", pane.pane_id() as u64),
                 "originPaneId": origin_pane_id,
                 "windowId": window_id,
                 "tabId": tab_id,
@@ -1431,7 +1983,8 @@ async fn ensure_managed_pane(
     let (_, origin_window_id, origin_tab_id) = mux
         .resolve_pane_id(origin_pane_id)
         .ok_or_else(|| anyhow!("origin pane {origin_pane_id} not found"))?;
-    let mut pools = MANAGED_PANES.lock().unwrap();
+    let service = automation_service();
+    let mut pools = service.managed_panes.lock().unwrap();
     let pool = pools.entry(origin_pane_id).or_default();
     // A managed pane may only be reused or extended while it remains in the
     // origin pane's tab. Moving it elsewhere removes it from this pool but
@@ -1545,7 +2098,7 @@ fn balance_managed_panel(tab_id: TabId, pane_ids: &[PaneId]) {
 }
 
 fn broadcast_event_to(target_client_id: Option<&str>, event: &str, data: Value) {
-    let revision = REVISION.fetch_add(1, Ordering::Relaxed) + 1;
+    let revision = service_revision().saturating_sub(1);
     let notification = EventNotification {
         jsonrpc: "2.0",
         method: "automation.event",
@@ -1555,7 +2108,8 @@ fn broadcast_event_to(target_client_id: Option<&str>, event: &str, data: Value) 
         return;
     };
 
-    let clients = CLIENTS
+    let clients = automation_service()
+        .clients
         .lock()
         .unwrap()
         .iter()
@@ -1569,7 +2123,8 @@ fn broadcast_event_to(target_client_id: Option<&str>, event: &str, data: Value) 
         }
     }
     if !stale.is_empty() {
-        let mut clients = CLIENTS.lock().unwrap();
+        let service = automation_service();
+        let mut clients = service.clients.lock().unwrap();
         for client_id in stale {
             clients.remove(&client_id);
         }
@@ -1577,9 +2132,15 @@ fn broadcast_event_to(target_client_id: Option<&str>, event: &str, data: Value) 
 }
 
 fn pane_is_busy(pane_id: PaneId) -> bool {
-    let command_id = MANAGED_PANE_OWNERS.lock().unwrap().get(&pane_id).cloned();
+    let command_id = automation_service()
+        .managed_pane_owners
+        .lock()
+        .unwrap()
+        .get(&pane_id)
+        .cloned();
     command_id.is_some_and(|command_id| {
-        MANAGED_COMMANDS
+        automation_service()
+            .managed_commands
             .lock()
             .unwrap()
             .get(&command_id)
@@ -1652,7 +2213,9 @@ fn make_callback_fifo(path: &Path) -> anyhow::Result<()> {
 }
 
 fn prepare_managed_shell() -> anyhow::Result<ManagedShellSetup> {
-    let sequence = SHELL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = automation_service()
+        .shell_sequence
+        .fetch_add(1, Ordering::Relaxed);
     let cleanup_dir = std::env::temp_dir().join(format!(
         "wezterm-automation-shell-{}-{sequence}",
         std::process::id()
@@ -1731,7 +2294,7 @@ fn watch_prompt_markers(pane_id: PaneId) {
                 .strip_prefix(PROMPT_MARKER_PREFIX)
                 .and_then(|value| value.parse::<u64>().ok())
             {
-                let (markers, changed) = &*PROMPT_MARKERS;
+                let (markers, changed) = &automation_service().prompt_markers;
                 let mut markers = markers.lock().unwrap();
                 markers.insert(pane_id, sequence);
                 changed.notify_all();
@@ -1744,7 +2307,7 @@ fn watch_prompt_markers(pane_id: PaneId) {
 }
 
 fn wait_for_prompt_marker(pane_id: PaneId, sequence: u64) -> bool {
-    let (markers, changed) = &*PROMPT_MARKERS;
+    let (markers, changed) = &automation_service().prompt_markers;
     let markers = markers.lock().unwrap();
     let (markers, _) = changed
         .wait_timeout_while(markers, Duration::from_secs(5), |markers| {
@@ -1759,13 +2322,13 @@ fn wait_for_prompt_marker(pane_id: PaneId, sequence: u64) -> bool {
 }
 
 fn mark_shell_ready(pane_id: PaneId) {
-    let (ready, changed) = &*SHELL_READY;
+    let (ready, changed) = &automation_service().shell_ready;
     ready.lock().unwrap().insert(pane_id);
     changed.notify_all();
 }
 
 fn wait_for_shell_ready(pane_id: PaneId) -> bool {
-    let (ready, changed) = &*SHELL_READY;
+    let (ready, changed) = &automation_service().shell_ready;
     let ready = ready.lock().unwrap();
     let (ready, _) = changed
         .wait_timeout_while(ready, Duration::from_secs(5), |ready| {
@@ -1781,7 +2344,7 @@ fn start_shell_callback(
     cleanup_dir: PathBuf,
 ) -> anyhow::Result<()> {
     watch_prompt_markers(pane_id);
-    let (ready, _) = &*SHELL_READY;
+    let (ready, _) = &automation_service().shell_ready;
     ready.lock().unwrap().remove(&pane_id);
 
     #[cfg(unix)]
@@ -1823,9 +2386,9 @@ fn start_shell_callback(
                     }
                     finish_running_command(pane_id, exit_code);
                 }
-                let (ready, _) = &*SHELL_READY;
+                let (ready, _) = &automation_service().shell_ready;
                 ready.lock().unwrap().remove(&pane_id);
-                let (markers, _) = &*PROMPT_MARKERS;
+                let (markers, _) = &automation_service().prompt_markers;
                 markers.lock().unwrap().remove(&pane_id);
                 let _ = fs::remove_dir_all(&cleanup_dir);
             })
@@ -1860,7 +2423,12 @@ fn open_callback_fifo(path: &Path) -> anyhow::Result<(std::fs::File, std::fs::Fi
 }
 
 fn finish_running_command(pane_id: PaneId, exit_code: i32) {
-    let command_id = MANAGED_PANE_OWNERS.lock().unwrap().get(&pane_id).cloned();
+    let command_id = automation_service()
+        .managed_pane_owners
+        .lock()
+        .unwrap()
+        .get(&pane_id)
+        .cloned();
     if let Some(command_id) = command_id {
         finish_command(
             &command_id,
@@ -1880,7 +2448,8 @@ fn finish_command(
     reason: Option<&str>,
 ) {
     let snapshot = {
-        let commands = MANAGED_COMMANDS.lock().unwrap();
+        let service = automation_service();
+        let commands = service.managed_commands.lock().unwrap();
         let Some(command) = commands.get(command_id) else {
             return;
         };
@@ -1893,7 +2462,8 @@ fn finish_command(
         capture_managed_command_output(&snapshot).unwrap_or_else(|_| (String::new(), true));
 
     let (event, owner_client_id) = {
-        let mut commands = MANAGED_COMMANDS.lock().unwrap();
+        let service = automation_service();
+        let mut commands = service.managed_commands.lock().unwrap();
         let Some(command) = commands.get_mut(command_id) else {
             return;
         };
@@ -1907,6 +2477,7 @@ fn finish_command(
         command.reason = reason.map(str::to_string);
         command.captured_output = Some(captured_output);
         command.output_truncated = output_truncated;
+        command.finished_at = Some(std::time::Instant::now());
         (
             json!({
                 "commandId": command_id,
@@ -1924,13 +2495,15 @@ fn finish_command(
         )
     };
     broadcast_event_to(owner_client_id.as_deref(), "command.finished", event);
+    reap_managed_commands();
 }
 
 fn watch_command(command_id: String, pane_id: PaneId) {
     // Shell prompt hooks deliver normal command completion through a side
     // channel. Mux lifecycle notifications only cover shell/pane teardown.
     Mux::get().subscribe(move |notification| {
-        if !MANAGED_COMMANDS
+        if !automation_service()
+            .managed_commands
             .lock()
             .unwrap()
             .get(&command_id)
@@ -2011,6 +2584,7 @@ mod tests {
     fn completed_command(pane_id: PaneId, output: &str) -> ManagedCommand {
         ManagedCommand {
             pane_id,
+            generation: 1,
             owner_client_id: None,
             running: false,
             exit_code: Some(0),
@@ -2021,6 +2595,7 @@ mod tests {
             output_start_x: 0,
             captured_output: Some(output.to_string()),
             output_truncated: false,
+            finished_at: None,
         }
     }
 
@@ -2036,10 +2611,15 @@ mod tests {
 
     #[test]
     fn stale_command_id_cannot_control_a_reused_pane() {
+        if Mux::try_get().is_none() {
+            let mux = Arc::new(Mux::new(None));
+            Mux::set_mux(&mux);
+        }
         let pane_id = usize::MAX - 2;
         let stale = completed_command(pane_id, "old output");
         let current = completed_command(pane_id, "new output");
-        MANAGED_PANE_OWNERS
+        automation_service()
+            .managed_pane_owners
             .lock()
             .unwrap()
             .insert(pane_id, "command-current".to_string());
@@ -2050,6 +2630,29 @@ mod tests {
             .contains("no longer owns"));
         ensure_command_owns_pane("command-current", &current).unwrap();
 
-        MANAGED_PANE_OWNERS.lock().unwrap().remove(&pane_id);
+        automation_service()
+            .managed_pane_owners
+            .lock()
+            .unwrap()
+            .remove(&pane_id);
+    }
+
+    #[test]
+    fn stable_refs_reject_wrong_instance_and_stale_generation() {
+        if Mux::try_get().is_none() {
+            let mux = Arc::new(Mux::new(None));
+            Mux::set_mux(&mux);
+        }
+        let pane = object_ref("pane", 42);
+        assert_eq!(ref_id(&pane, "pane").unwrap(), 42);
+        let mut wrong = pane.clone();
+        wrong["muxInstanceId"] = json!("other");
+        assert!(ref_id(&wrong, "pane").is_err());
+        let mut stale = pane;
+        stale["generation"] = json!(0);
+        assert!(ref_id(&stale, "pane")
+            .unwrap_err()
+            .to_string()
+            .contains("STALE_OBJECT"));
     }
 }

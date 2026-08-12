@@ -298,7 +298,10 @@ impl WorkspaceManager {
         file.insert("version".to_string(), Value::from(3));
         file.insert("workspace".to_string(), Value::from(workspace.to_string()));
         if let Some(previous) = &self.previous {
-            file.insert("previous_workspace".to_string(), Value::from(previous.clone()));
+            file.insert(
+                "previous_workspace".to_string(),
+                Value::from(previous.clone()),
+            );
         }
         write_json(&self.last_location_path, &Value::Object(file));
     }

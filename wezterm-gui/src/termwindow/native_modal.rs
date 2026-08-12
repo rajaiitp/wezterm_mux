@@ -3,6 +3,7 @@ use crate::termwindow::box_model::*;
 use crate::termwindow::modal::Modal;
 use crate::termwindow::{DimensionContext, GuiWin, TermWindow};
 use crate::utilsprites::RenderMetrics;
+use ::window::{MouseEventKind, MousePress};
 use config::keyassignment::{
     Confirmation, InputSelector, InputSelectorEntry, KeyAssignment, PromptInputLine,
 };
@@ -11,7 +12,7 @@ use mux_lua::MuxPane;
 use rayon::prelude::*;
 use std::cell::{Ref, RefCell};
 use std::rc::Rc;
-use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
+use wezterm_term::{KeyCode, KeyModifiers};
 use window::RectF;
 
 fn element_colors(bg: InheritableColor, text: InheritableColor) -> ElementColors {
@@ -61,6 +62,18 @@ fn selection_colors(term_window: &mut TermWindow) -> (InheritableColor, Inherita
         palette.colors.0[8].to_linear().into(),
         palette.foreground.to_linear().into(),
     )
+}
+
+fn row_at(element: &ComputedElement, x: f32, y: f32) -> Option<usize> {
+    let ComputedElementContent::Children(children) = &element.content else {
+        return None;
+    };
+    children.iter().position(|child| {
+        x >= child.bounds.min_x()
+            && x <= child.bounds.max_x()
+            && y >= child.bounds.min_y()
+            && y <= child.bounds.max_y()
+    })
 }
 
 fn clip_modal_children(element: &mut ComputedElement, clip: RectF) {
@@ -293,7 +306,34 @@ impl NativeInputSelector {
 }
 
 impl Modal for NativeInputSelector {
-    fn mouse_event(&self, _event: MouseEvent, _term_window: &mut TermWindow) -> anyhow::Result<()> {
+    fn mouse_event(
+        &self,
+        event: ::window::MouseEvent,
+        term_window: &mut TermWindow,
+    ) -> anyhow::Result<()> {
+        if !matches!(event.kind, MouseEventKind::Press(MousePress::Left)) {
+            return Ok(());
+        }
+        let elements = self.element.borrow();
+        let Some(panel) = elements.as_ref().and_then(|elements| elements.first()) else {
+            return Ok(());
+        };
+        let Some(row) = row_at(panel, event.coords.x as f32, event.coords.y as f32) else {
+            return Ok(());
+        };
+        let view = self.view.borrow();
+        // Title, spacer, optional query, and visible choices precede the footer.
+        let query_rows = usize::from(!self.args.fuzzy_description.is_empty());
+        let first_choice = 2 + query_rows;
+        let selected = view.top + row.saturating_sub(first_choice);
+        drop(view);
+        if selected < self.view.borrow().filtered.len() && row >= first_choice {
+            self.view.borrow_mut().selected = selected;
+            self.finish(
+                term_window,
+                Some(self.view.borrow().filtered[selected].clone()),
+            );
+        }
         Ok(())
     }
 
@@ -521,7 +561,25 @@ impl NativePromptInput {
 }
 
 impl Modal for NativePromptInput {
-    fn mouse_event(&self, _event: MouseEvent, _term_window: &mut TermWindow) -> anyhow::Result<()> {
+    fn mouse_event(
+        &self,
+        event: ::window::MouseEvent,
+        term_window: &mut TermWindow,
+    ) -> anyhow::Result<()> {
+        if matches!(event.kind, MouseEventKind::Press(MousePress::Left)) {
+            if let Some(elements) = self.element.borrow().as_ref() {
+                if let Some(panel) = elements.first() {
+                    if let Some(row) = row_at(panel, event.coords.x as f32, event.coords.y as f32) {
+                        if row == 2 {
+                            self.finish(
+                                term_window,
+                                Some(self.view.borrow().input.iter().collect::<String>()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -697,7 +755,30 @@ impl NativeConfirmation {
 }
 
 impl Modal for NativeConfirmation {
-    fn mouse_event(&self, _event: MouseEvent, _term_window: &mut TermWindow) -> anyhow::Result<()> {
+    fn mouse_event(
+        &self,
+        event: ::window::MouseEvent,
+        term_window: &mut TermWindow,
+    ) -> anyhow::Result<()> {
+        if !matches!(event.kind, MouseEventKind::Press(MousePress::Left)) {
+            return Ok(());
+        }
+        let elements = self.element.borrow();
+        let Some(panel) = elements.as_ref().and_then(|elements| elements.first()) else {
+            return Ok(());
+        };
+        let Some(row) = row_at(panel, event.coords.x as f32, event.coords.y as f32) else {
+            return Ok(());
+        };
+        let wrapped = textwrap::wrap(
+            &self.args.message,
+            self.args.message.chars().count().clamp(40, 72),
+        );
+        let buttons = wrapped.len() + 3;
+        if row == buttons {
+            let midpoint = panel.content_rect.center().x;
+            self.finish(term_window, (event.coords.x as f32) < midpoint);
+        }
         Ok(())
     }
 

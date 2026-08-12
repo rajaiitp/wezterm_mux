@@ -6889,6 +6889,7 @@ dependencies = [
  "url",
  "wezterm-client",
  "wezterm-gui-subcommands",
+ "wezterm-session-state",
  "wezterm-term",
  "winapi",
 ]
@@ -7166,6 +7167,7 @@ dependencies = [
  "wezterm-gui-subcommands",
  "wezterm-mux-server-impl",
  "wezterm-open-url",
+ "wezterm-session-state",
  "wezterm-ssh",
  "wezterm-term",
  "wezterm-toast-notification",
@@ -7202,6 +7204,7 @@ dependencies = [
  "async_ossl",
  "cc",
  "clap",
+ "codec",
  "config",
  "embed-resource",
  "env-bootstrap",
@@ -7217,6 +7220,7 @@ dependencies = [
  "wezterm-blob-leases",
  "wezterm-gui-subcommands",
  "wezterm-mux-server-impl",
+ "wezterm-session-state",
  "wezterm-term",
  "winapi",
 ]
@@ -7247,6 +7251,7 @@ dependencies = [
  "termwiz",
  "url",
  "wezterm-client",
+ "wezterm-session-state",
  "wezterm-term",
  "wezterm-uds",
  "winapi",
@@ -7257,6 +7262,19 @@ name = "wezterm-open-url"
 version = "0.1.0"
 dependencies = [
  "winapi",
+]
+
+[[package]]
+name = "wezterm-session-state"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codec",
+ "dirs-next",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

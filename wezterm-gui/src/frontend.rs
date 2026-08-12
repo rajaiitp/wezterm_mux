@@ -18,6 +18,7 @@ use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
 use wezterm_toast_notification::*;
 
+#[cfg(feature = "native_session_legacy")]
 pub(crate) fn schedule_native_session_save() {
     promise::spawn::spawn(async {
         smol::Timer::after(std::time::Duration::from_millis(100)).await;
@@ -27,6 +28,9 @@ pub(crate) fn schedule_native_session_save() {
     })
     .detach();
 }
+
+#[cfg(not(feature = "native_session_legacy"))]
+pub(crate) fn schedule_native_session_save() {}
 
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,

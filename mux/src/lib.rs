@@ -17,6 +17,7 @@ use parking_lot::{
 };
 use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Read, Write};
@@ -119,6 +120,7 @@ pub struct Mux {
     num_panes_by_workspace: RwLock<HashMap<String, usize>>,
     main_thread_id: std::thread::ThreadId,
     agent: Option<AgentProxy>,
+    services: RwLock<HashMap<&'static str, Arc<dyn Any + Send + Sync>>>,
 }
 
 const BUFSIZE: usize = 1024 * 1024;
@@ -479,6 +481,7 @@ impl Mux {
             num_panes_by_workspace: RwLock::new(HashMap::new()),
             main_thread_id: std::thread::current().id(),
             agent,
+            services: RwLock::new(HashMap::new()),
         }
     }
 
@@ -632,9 +635,11 @@ impl Mux {
             .read()
             .values()
             .any(|window| window.get_workspace() == workspace)
-            || self.clients.read().values().any(|client| {
-                client.active_workspace.as_deref() == Some(workspace)
-            })
+            || self
+                .clients
+                .read()
+                .values()
+                .any(|client| client.active_workspace.as_deref() == Some(workspace))
     }
 
     /// Generate a new unique workspace name.
@@ -710,9 +715,10 @@ impl Mux {
     pub fn restore_previous_workspace_for_client(&self, ident: &Arc<ClientId>) {
         let mut clients = self.clients.write();
         let changed = if let Some(info) = clients.get_mut(&ident) {
-            let previous = info.previous_workspace.take().or_else(|| {
-                Some(self.get_default_workspace())
-            });
+            let previous = info
+                .previous_workspace
+                .take()
+                .or_else(|| Some(self.get_default_workspace()));
             if let Some(previous) = previous {
                 info.active_workspace.replace(previous);
                 info.creating_workspace = false;
@@ -806,11 +812,7 @@ impl Mux {
         }
     }
 
-    pub fn rename_workspace(
-        &self,
-        old_workspace: &str,
-        new_workspace: &str,
-    ) -> anyhow::Result<()> {
+    pub fn rename_workspace(&self, old_workspace: &str, new_workspace: &str) -> anyhow::Result<()> {
         if old_workspace.is_empty() || new_workspace.is_empty() {
             anyhow::bail!("workspace names cannot be empty");
         }
@@ -878,6 +880,16 @@ impl Mux {
             .insert(sub_id, Box::new(subscriber));
     }
 
+    /// Subscribe to topology changes without requiring consumers to maintain
+    /// their own best-effort timers. The callback is invoked on the mux main
+    /// thread, so callers should hand work to their own executor.
+    pub fn subscribe_persistence<F>(&self, subscriber: F)
+    where
+        F: Fn(MuxNotification) -> bool + 'static + Send + Sync,
+    {
+        self.subscribe(subscriber);
+    }
+
     pub fn notify(&self, notification: MuxNotification) {
         let mut subscribers = self.subscribers.write();
         subscribers.retain(|_, notify| notify(notification.clone()));
@@ -924,6 +936,34 @@ impl Mux {
         self.domains_by_name
             .write()
             .insert(domain.domain_name().to_string(), Arc::clone(domain));
+    }
+
+    pub fn register_service<T: Any + Send + Sync>(&self, name: &'static str, service: Arc<T>) {
+        self.services.write().insert(name, service);
+    }
+
+    pub fn get_or_register_service<T, F>(&self, name: &'static str, create: F) -> Arc<T>
+    where
+        T: Any + Send + Sync,
+        F: FnOnce() -> Arc<T>,
+    {
+        let mut services = self.services.write();
+        if let Some(service) = services.get(name) {
+            return Arc::clone(service)
+                .downcast::<T>()
+                .expect("mux service name was registered with another type");
+        }
+        let service = create();
+        let erased: Arc<dyn Any + Send + Sync> = service.clone();
+        services.insert(name, erased);
+        service
+    }
+
+    pub fn service<T: Any + Send + Sync>(&self, name: &'static str) -> Option<Arc<T>> {
+        self.services
+            .read()
+            .get(name)
+            .and_then(|service| Arc::clone(service).downcast::<T>().ok())
     }
 
     pub fn set_mux(mux: &Arc<Mux>) {
