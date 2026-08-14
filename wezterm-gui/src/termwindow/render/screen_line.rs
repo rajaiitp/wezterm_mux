@@ -18,6 +18,29 @@ use wezterm_bidi::Direction;
 use wezterm_term::color::ColorAttribute;
 use wezterm_term::CellAttributes;
 
+fn inactive_pane_style(base: &TextStyle, attrs: &CellAttributes) -> TextStyle {
+    let mut style = base.clone();
+    let intensity = attrs.intensity();
+    let italic = attrs.italic();
+
+    for font in &mut style.font {
+        // `inactive_pane_font` supplies the family and base weight. Reapply
+        // terminal attributes on top so bold, dim and italic cells retain
+        // their semantics in inactive panes.
+        font.weight = match intensity {
+            wezterm_term::Intensity::Bold => font.weight.bolder(),
+            wezterm_term::Intensity::Half => font.weight.lighter(),
+            wezterm_term::Intensity::Normal => font.weight,
+        };
+        if italic {
+            font.style = config::FontStyle::Italic;
+        }
+        font.is_synthetic = true;
+    }
+
+    style
+}
+
 impl crate::TermWindow {
     /// "Render" a line of the terminal screen into the vertex buffer.
     /// This is nominally a matter of setting the fg/bg color and the
@@ -41,7 +64,10 @@ impl crate::TermWindow {
 
         let num_cols = params.dims.cols;
 
-        let hsv = if params.is_active || params.config.inactive_pane_background.is_some() {
+        let hsv = if params.is_active
+            || params.config.inactive_pane_background.is_some()
+            || params.config.inactive_pane_font.is_some()
+        {
             None
         } else {
             Some(params.config.inactive_pane_hsb)
@@ -757,6 +783,11 @@ impl crate::TermWindow {
             {
                 let attrs = &cluster.attrs;
                 let style = self.fonts.match_style(params.config, attrs);
+                let pane_style = params
+                    .shape_key
+                    .as_ref()
+                    .and_then(|key| key.pane_font.as_ref())
+                    .map(|base| inactive_pane_style(base, attrs));
                 let hyperlink = attrs.hyperlink();
                 let is_highlited_hyperlink =
                     same_hyperlink(hyperlink, self.current_highlight.as_ref());
@@ -852,6 +883,7 @@ impl crate::TermWindow {
                 last_style.replace(ClusterStyleCache {
                     attrs,
                     style,
+                    pane_style,
                     underline_tex_rect: underline_tex_rect.clone(),
                     bg_color,
                     fg_color: glyph_color,
@@ -862,7 +894,10 @@ impl crate::TermWindow {
             let style_params = last_style.as_ref().expect("we just set it up").clone();
 
             let glyph_info = self.cached_cluster_shape(
-                style_params.style,
+                style_params
+                    .pane_style
+                    .as_ref()
+                    .unwrap_or(style_params.style),
                 &cluster,
                 &gl_state,
                 None,

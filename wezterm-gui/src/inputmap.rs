@@ -79,17 +79,7 @@ fn install_leader_defaults(keys: &mut KeyTables) {
     );
     add_leader_default(keys, KeyCode::Char('z'), TogglePaneZoomState);
     add_leader_default(keys, KeyCode::Char('\t'), SwitchWorkspaceRelative(-1));
-    add_leader_default(
-        keys,
-        KeyCode::Char('s'),
-        ShowLauncherArgs(LauncherActionArgs {
-            flags: LauncherFlags::FUZZY | LauncherFlags::WORKSPACES,
-            title: Some("Choose workspace".to_string()),
-            help_text: None,
-            fuzzy_help_text: None,
-            alphabet: None,
-        }),
-    );
+    add_leader_default(keys, KeyCode::Char('s'), ShowWorkspacePicker);
     add_leader_default(
         keys,
         KeyCode::Char('w'),

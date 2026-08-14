@@ -9,12 +9,15 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use termwiz::cell::{AttributeChange, Intensity};
 use termwiz_funcs::{format_as_escapes, FormatColor, FormatItem};
+use wezterm_project_workspace::{default_registry_path, Registry, WorkspaceId};
 
 pub const DEFAULT_WORKSPACE: &str = "default";
 pub const WORKSPACE_PICKER_EVENT: &str = "__wezterm_workspace_picker";
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 struct LastTab {
+    #[serde(default)]
+    tab_id: Option<usize>,
     #[serde(default)]
     tab_index: Option<usize>,
     #[serde(default)]
@@ -166,13 +169,15 @@ impl WorkspaceManager {
         let Some(tab) = window.get_active() else {
             return;
         };
-        self.last_tabs.insert(
-            workspace.to_string(),
-            LastTab {
-                tab_index: Some(window.get_active_idx()),
-                tab_title: Some(tab.get_title()),
-            },
-        );
+        let remembered = LastTab {
+            tab_id: Some(tab.tab_id()),
+            tab_index: Some(window.get_active_idx()),
+            tab_title: Some(tab.get_title()),
+        };
+        if self.last_tabs.get(workspace) == Some(&remembered) {
+            return;
+        }
+        self.last_tabs.insert(workspace.to_string(), remembered);
         self.write_tabs();
     }
 
@@ -184,25 +189,20 @@ impl WorkspaceManager {
         let Some(mut window) = mux.get_window_mut(window_id) else {
             return;
         };
-        // The index is the authoritative identity for the active tab. Empty
-        // titles are common, and searching by title first would always match
-        // the first tab and discard the remembered index.
+        // Prefer the stable mux tab id while the persistent mux is alive.
+        // After a full mux restart the id may change, so fall back to the
+        // title and finally the saved position.
         let target = remembered
-            .tab_index
-            .filter(|index| *index < window.len())
+            .tab_id
+            .and_then(|tab_id| window.iter().position(|tab| tab.tab_id() == tab_id))
             .or_else(|| {
                 remembered
                     .tab_title
                     .as_deref()
                     .filter(|title| !title.is_empty())
-                    .and_then(|title| {
-                        window
-                            .iter()
-                            .enumerate()
-                            .find(|(_, tab)| tab.get_title() == title)
-                            .map(|(index, _)| index)
-                    })
-            });
+                    .and_then(|title| window.iter().position(|tab| tab.get_title() == title))
+            })
+            .or_else(|| remembered.tab_index.filter(|index| *index < window.len()));
         if let Some(index) = target {
             if index < window.len() {
                 window.set_active_without_saving(index);
@@ -216,10 +216,12 @@ impl WorkspaceManager {
         } else {
             active
         };
+        let display_name = self.display_name(active).to_uppercase();
         let names = vec![active.to_string()];
         log::trace!(
-            "workspace manager active={} ordered={:?} previous={:?}",
+            "workspace manager active={} display_name={} ordered={:?} previous={:?}",
             active,
+            display_name,
             self.display_names(),
             self.previous,
         );
@@ -229,7 +231,7 @@ impl WorkspaceManager {
             FormatItem::Background(FormatColor::Color("#83a598".to_string())),
             FormatItem::Foreground(FormatColor::Color("#1d2021".to_string())),
             FormatItem::Attribute(AttributeChange::Intensity(Intensity::Bold)),
-            FormatItem::Text(format!("  {active}  ")),
+            FormatItem::Text(format!("  {display_name}  ")),
             FormatItem::Attribute(AttributeChange::Intensity(Intensity::Normal)),
             FormatItem::Background(FormatColor::Color("#1d2021".to_string())),
             FormatItem::Text(" ".to_string()),
@@ -239,10 +241,28 @@ impl WorkspaceManager {
         (status, names)
     }
 
+    fn display_name(&self, active: &str) -> String {
+        let Ok(path) = default_registry_path() else {
+            return active.to_string();
+        };
+        let Ok(registry) = Registry::load(&path) else {
+            return active.to_string();
+        };
+        registry
+            .workspaces
+            .get(&WorkspaceId(active.to_string()))
+            .map(|workspace| workspace.label.trim())
+            .filter(|label| !label.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| active.to_string())
+    }
+
     pub fn picker_names(&mut self, active: &str) -> Vec<String> {
-        let mut names = vec![DEFAULT_WORKSPACE.to_string()];
-        names.extend(self.display_names());
-        if !names.iter().any(|name| name == active) && workspace_is_live(active) {
+        let mut names = self.display_names();
+        if !names.iter().any(|name| name == active)
+            && active != DEFAULT_WORKSPACE
+            && workspace_is_live(active)
+        {
             names.push(active.to_string());
         }
         names

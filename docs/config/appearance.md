@@ -445,6 +445,18 @@ The range of these values is 0.0 and up; they are used to multiply the existing
 values, so the default of 1.0 preserves the existing component, whilst 0.5 will
 reduce it by half, and 2.0 will double the value.
 
+You can also select a separate font style for inactive panes. This changes the
+font face/weight without changing the pane background:
+
+```lua
+config.inactive_pane_font = wezterm.font_with_fallback({
+  { family = "JetBrains Mono", weight = "ExtraLight" },
+})
+```
+
+When unset, inactive panes use the normal configured font. Font rules based on
+terminal cell attributes continue to apply to the selected pane font.
+
 ## Window Background Image
 
 ![Screenshot](../screenshots/wezterm-vday-screenshot.png)

@@ -76,11 +76,13 @@ impl super::TermWindow {
         } + border.top.get() as isize;
 
         let (padding_left, padding_top) = self.padding_left_top();
+        let (pane_padding_left, pane_padding_top, _, _) = self.pane_content_padding_pixels();
 
         let y = (event
             .coords
             .y
             .sub(padding_top as isize)
+            .sub(pane_padding_top as isize)
             .sub(first_line_offset)
             .max(0)
             / self.render_metrics.cell_size.height) as i64;
@@ -89,6 +91,7 @@ impl super::TermWindow {
             .coords
             .x
             .sub((padding_left + border.left.get() as f32) as isize)
+            .sub(pane_padding_left as isize)
             .max(0) as f32)
             / self.render_metrics.cell_size.width as f32;
         let x = if !pane.is_mouse_grabbed() {
@@ -104,7 +107,8 @@ impl super::TermWindow {
             .coords
             .y
             .sub(padding_top as isize)
-            .sub(first_line_offset);
+            .sub(first_line_offset)
+            .sub(pane_padding_top as isize);
         if y > 0 {
             y_pixel_offset = y_pixel_offset.max(0) % self.render_metrics.cell_size.height;
         }
@@ -112,7 +116,8 @@ impl super::TermWindow {
         let mut x_pixel_offset = event
             .coords
             .x
-            .sub((padding_left + border.left.get() as f32) as isize);
+            .sub((padding_left + border.left.get() as f32) as isize)
+            .sub(pane_padding_left as isize);
         if x > 0 {
             x_pixel_offset = x_pixel_offset.max(0) % self.render_metrics.cell_size.width;
         }
@@ -567,7 +572,12 @@ impl super::TermWindow {
                         self.show_workspace_dropdown();
                     }
                 }
-                TabBarItem::None | TabBarItem::LeftStatus => {
+                TabBarItem::LeftStatus => {
+                    if self.workspace_at_left_status(&ui_item).is_some() {
+                        self.show_workspace_dropdown();
+                    }
+                }
+                TabBarItem::None => {
                     let maximized = self
                         .window_state
                         .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);

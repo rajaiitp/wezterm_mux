@@ -1639,6 +1639,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Shell"],
             icon: None,
         },
+        ShowWorkspacePicker => CommandDef {
+            brief: "Switch workspace".into(),
+            doc: "Choose an active workspace".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window", "Workspace"],
+            icon: Some("cod_list_selection"),
+        },
         ShowProjectWorkspacePicker => CommandDef {
             brief: "Open project workspace picker".into(),
             doc: "Choose a project and Git worktree for an integrated development workspace".into(),
@@ -2160,6 +2168,8 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         TogglePaneZoomState,
         ActivateLastTab,
         ShowLauncher,
+        ShowWorkspacePicker,
+        ShowProjectWorkspacePicker,
         ShowTabNavigator,
         // ----------------- Help
         OpenUri("https://wezterm.org/".to_string()),

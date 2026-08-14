@@ -351,6 +351,52 @@ impl super::TermWindow {
         }
     }
 
+    pub fn reconcile_pane_content_sizes(&mut self) {
+        let (padding_left, padding_top, padding_right, padding_bottom) =
+            self.pane_content_padding_pixels();
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+        let removed_cols = ((padding_left + padding_right) / cell_width).ceil() as usize;
+        let removed_rows = ((padding_top + padding_bottom) / cell_height).ceil() as usize;
+
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+
+        for tab in window.iter() {
+            for pos in tab.iter_panes_ignoring_zoom() {
+                let target_cols = pos.width.saturating_sub(removed_cols).max(1);
+                let target_rows = pos.height.saturating_sub(removed_rows).max(1);
+                let current = pos.pane.get_dimensions();
+                if current.cols == target_cols && current.viewport_rows == target_rows {
+                    continue;
+                }
+
+                let size = TerminalSize {
+                    cols: target_cols,
+                    rows: target_rows,
+                    pixel_width: target_cols * self.render_metrics.cell_size.width as usize,
+                    pixel_height: target_rows * self.render_metrics.cell_size.height as usize,
+                    dpi: self.terminal_size.dpi,
+                };
+                log::debug!(
+                    "resizing pane {} for content padding: {:?} -> {:?}",
+                    pos.pane.pane_id(),
+                    current,
+                    size
+                );
+                if let Err(err) = pos.pane.resize_preserving_layout(size) {
+                    log::warn!(
+                        "failed to resize pane {} for content padding: {:#}",
+                        pos.pane.pane_id(),
+                        err
+                    );
+                }
+            }
+        }
+    }
+
     pub fn current_cell_dimensions(&self) -> RowsAndCols {
         RowsAndCols {
             rows: self.terminal_size.rows as usize,

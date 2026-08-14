@@ -169,6 +169,11 @@ impl crate::TermWindow {
             }
         }
 
+        // Apply content padding to the PTY dimensions before rendering. This
+        // lets terminal applications lay themselves out for the exposed area
+        // instead of rendering a full pane and being clipped afterward.
+        self.reconcile_pane_content_sizes();
+
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
 
@@ -252,7 +257,7 @@ impl crate::TermWindow {
             .context("filled_rectangle for window background")?;
         }
 
-        for pos in panes {
+        for pos in panes.iter() {
             let centered_overlay = self.is_centered_overlay_pane(pos.pane.pane_id());
             if centered_overlay {
                 let tab_bar_height = if self.show_tab_bar {
@@ -340,12 +345,20 @@ impl crate::TermWindow {
             }
         }
 
-        if let Some(pane) = self.get_active_pane_or_overlay() {
-            let splits = self.get_splits();
-            for split in &splits {
-                self.paint_split(&mut layers, split, &pane)
-                    .context("paint_split")?;
-            }
+        // Draw inactive borders first so the active pane's border wins at
+        // shared edges.
+        for pos in panes.iter().filter(|pos| !pos.is_active) {
+            self.paint_pane_border(pos, &mut layers)
+                .context("paint inactive pane border")?;
+        }
+        for pos in panes.iter().filter(|pos| pos.is_active) {
+            self.paint_pane_border(pos, &mut layers)
+                .context("paint active pane border")?;
+        }
+
+        let splits = self.get_splits();
+        for split in &splits {
+            self.register_split(split).context("register_split")?;
         }
 
         if self.show_tab_bar {

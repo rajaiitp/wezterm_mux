@@ -521,8 +521,14 @@ impl GuiFrontEnd {
         true
     }
 
-    pub fn workspace_status(&self, active: &str) -> (String, Vec<String>) {
-        self.workspace_manager.borrow_mut().status(active)
+    pub fn workspace_status(&self, window_id: MuxWindowId, active: &str) -> (String, Vec<String>) {
+        let workspace = Mux::get()
+            .get_window(window_id)
+            .map(|window| window.get_workspace().to_string())
+            .unwrap_or_else(|| active.to_string());
+        let mut manager = self.workspace_manager.borrow_mut();
+        manager.remember_active_tab(window_id, &workspace);
+        manager.status(active)
     }
 
     pub fn previous_workspace(&self) -> Option<String> {

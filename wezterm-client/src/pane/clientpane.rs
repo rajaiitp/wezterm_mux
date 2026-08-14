@@ -250,6 +250,56 @@ impl ClientPane {
     pub fn ignore_next_kill(&self) {
         *self.ignore_next_kill.lock() = true;
     }
+
+    fn resize_inner(&self, size: TerminalSize, preserve_layout: bool) -> anyhow::Result<()> {
+        if self
+            .client
+            .closing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let render = self.renderable.lock();
+        let mut inner = render.inner.borrow_mut();
+
+        let cols = size.cols as usize;
+        let rows = size.rows as usize;
+
+        if inner.dimensions.cols != cols
+            || inner.dimensions.viewport_rows != rows
+            || inner.dimensions.pixel_width != size.pixel_width
+            || inner.dimensions.pixel_height != size.pixel_height
+        {
+            inner.dimensions.cols = cols;
+            inner.dimensions.viewport_rows = rows;
+            inner.dimensions.pixel_width = size.pixel_width;
+            inner.dimensions.pixel_height = size.pixel_height;
+
+            inner.make_all_stale();
+
+            let client = Arc::clone(&self.client);
+            let remote_pane_id = self.remote_pane_id;
+            let remote_tab_id = self.remote_tab_id;
+            promise::spawn::spawn(async move {
+                if client.closing.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(());
+                }
+                client
+                    .client
+                    .resize(Resize {
+                        containing_tab_id: remote_tab_id,
+                        pane_id: remote_pane_id,
+                        size,
+                        preserve_layout,
+                    })
+                    .await
+                    .map(|_| ())
+            })
+            .detach();
+            inner.update_last_send();
+        }
+        Ok(())
+    }
 }
 
 #[async_trait(?Send)]
@@ -387,53 +437,11 @@ impl Pane for ClientPane {
     }
 
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
-        if self
-            .client
-            .closing
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Ok(());
-        }
-        let render = self.renderable.lock();
-        let mut inner = render.inner.borrow_mut();
+        self.resize_inner(size, false)
+    }
 
-        let cols = size.cols as usize;
-        let rows = size.rows as usize;
-
-        if inner.dimensions.cols != cols
-            || inner.dimensions.viewport_rows != rows
-            || inner.dimensions.pixel_width != size.pixel_width
-            || inner.dimensions.pixel_height != size.pixel_height
-        {
-            inner.dimensions.cols = cols;
-            inner.dimensions.viewport_rows = rows;
-            inner.dimensions.pixel_width = size.pixel_width;
-            inner.dimensions.pixel_height = size.pixel_height;
-
-            // Invalidate any cached rows on a resize
-            inner.make_all_stale();
-
-            let client = Arc::clone(&self.client);
-            let remote_pane_id = self.remote_pane_id;
-            let remote_tab_id = self.remote_tab_id;
-            promise::spawn::spawn(async move {
-                if client.closing.load(std::sync::atomic::Ordering::Acquire) {
-                    return Ok(());
-                }
-                client
-                    .client
-                    .resize(Resize {
-                        containing_tab_id: remote_tab_id,
-                        pane_id: remote_pane_id,
-                        size,
-                    })
-                    .await
-                    .map(|_| ())
-            })
-            .detach();
-            inner.update_last_send();
-        }
-        Ok(())
+    fn resize_preserving_layout(&self, size: TerminalSize) -> anyhow::Result<()> {
+        self.resize_inner(size, true)
     }
 
     async fn search(

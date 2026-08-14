@@ -497,9 +497,14 @@ impl TabBarState {
         let right_status_width = parse_status_text(right_status, CellAttributes::default())
             .len()
             .min(title_width);
+        let new_tab_width = if config.show_new_tab_button_in_tab_bar {
+            new_tab.len()
+        } else {
+            0
+        };
         let fixed_width = number_of_tabs
             .saturating_sub(1)
-            .saturating_add(new_tab.len())
+            .saturating_add(new_tab_width)
             .saturating_add(left_status_width)
             .saturating_add(right_status_width);
         let available_cells = title_width.saturating_sub(fixed_width);
@@ -554,6 +559,7 @@ impl TabBarState {
             line.append_line(left_status_line, SEQ_ZERO);
         }
 
+        // Tabs follow the workspace/project label directly at the left edge.
         for (tab_idx, tab_title) in tab_titles.iter().enumerate() {
             let tab_title_len = tab_title.len.min(tab_width_max);
             let active = tab_idx == active_tab_no;

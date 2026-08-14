@@ -1736,6 +1736,34 @@ impl TermWindow {
         }
     }
 
+    fn set_native_workspace_click_targets(&mut self, workspaces: &[String], status_width: usize) {
+        self.right_status_click_targets.clear();
+        if workspaces.len() == 1 {
+            self.right_status_click_targets
+                .push((workspaces[0].clone(), 1, status_width));
+        } else {
+            self.set_right_status_click_targets(workspaces);
+        }
+    }
+
+    pub(crate) fn workspace_at_left_status(&self, item: &UIItem) -> Option<String> {
+        let cell_width = self.render_metrics.cell_size.width as usize;
+        if cell_width == 0 {
+            return None;
+        }
+        let item_x = item.x / cell_width;
+        let item_width = item.width / cell_width;
+        let relative = self.last_mouse_coords.0 as isize - item_x as isize;
+        if relative < 0 || relative >= item_width as isize {
+            return None;
+        }
+        let content_x = relative as usize;
+        self.right_status_click_targets
+            .iter()
+            .find(|(_, start, end)| content_x >= *start && content_x < *end)
+            .map(|(workspace, _, _)| workspace.clone())
+    }
+
     pub(crate) fn workspace_at_right_status(&self, item: &UIItem) -> Option<String> {
         // UIItem coordinates are pixels, while last_mouse_coords is measured
         // in terminal cells.
@@ -2188,20 +2216,28 @@ impl TermWindow {
             None => false,
         };
 
-        let (native_right_status, native_workspace_targets) =
+        let (native_workspace_status, native_workspace_targets) =
             if let Some(front_end) = crate::frontend::try_front_end() {
-                front_end.workspace_status(&mux.active_workspace())
+                front_end.workspace_status(self.mux_window_id, &mux.active_workspace())
             } else {
-                (self.right_status.clone(), Vec::new())
+                (String::new(), Vec::new())
             };
-        self.set_right_status_click_targets(&native_workspace_targets);
+        self.set_native_workspace_click_targets(
+            &native_workspace_targets,
+            native_workspace_status.len(),
+        );
         log::trace!(
             "workspace status window={} active={:?} targets={} status_bytes={}",
             self.mux_window_id,
             mux.active_workspace(),
             native_workspace_targets.len(),
-            native_right_status.len(),
+            native_workspace_status.len(),
         );
+
+        // Keep the active project/worktree label at the left edge and leave
+        // the right edge available for user-provided status text.
+        let mut tab_left_status = native_workspace_status;
+        tab_left_status.push_str(&self.left_status);
 
         let new_tab_bar = TabBarState::new(
             self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
@@ -2214,8 +2250,8 @@ impl TermWindow {
             &panes,
             self.config.resolved_palette.tab_bar.as_ref(),
             &self.config,
-            &self.left_status,
-            &native_right_status,
+            &tab_left_status,
+            &self.right_status,
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
@@ -2338,15 +2374,18 @@ impl TermWindow {
                 0.0
             };
             let (padding_left, padding_top) = self.padding_left_top();
+            let (pane_padding_left, pane_padding_top, _, _) = self.pane_content_padding_pixels();
 
             let r = Rect::new(
                 Point::new(
                     (((cursor.x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
-                        .add(padding_left as isize),
+                        .add(padding_left as isize)
+                        .add(pane_padding_left as isize),
                     ((cursor.y + pos.top as isize - top).max(0)
                         * self.render_metrics.cell_size.height)
                         .add(tab_bar_height as isize)
-                        .add(padding_top as isize),
+                        .add(padding_top as isize)
+                        .add(pane_padding_top as isize),
                 ),
                 self.render_metrics.cell_size,
             );
@@ -2500,6 +2539,10 @@ impl TermWindow {
     }
 
     fn show_project_workspace_picker(&mut self) {
+        self.show_project_workspace_picker_with_filter(String::new());
+    }
+
+    pub(crate) fn show_project_workspace_picker_with_filter(&mut self, initial_filter: String) {
         let catalog = crate::project_workspace::discover_projects(&self.config);
         let choices = catalog
             .entries()
@@ -2522,18 +2565,21 @@ impl TermWindow {
             log::warn!("project workspace picker found no Git repositories");
             return;
         }
-        self.show_input_selector(&InputSelector {
-            action: Box::new(KeyAssignment::EmitEvent(
-                crate::project_workspace::PROJECT_EVENT.to_string(),
-            )),
-            title: "Project workspace".to_string(),
-            choices,
-            fuzzy: true,
-            alphabet: Default::default(),
-            description: Default::default(),
-            fuzzy_description: Default::default(),
-            delete_action: None,
-        });
+        self.show_input_selector_with_filter(
+            &InputSelector {
+                action: Box::new(KeyAssignment::EmitEvent(
+                    crate::project_workspace::PROJECT_EVENT.to_string(),
+                )),
+                title: "Project workspace".to_string(),
+                choices,
+                fuzzy: true,
+                alphabet: Default::default(),
+                description: Default::default(),
+                fuzzy_description: Default::default(),
+                delete_action: None,
+            },
+            initial_filter,
+        );
     }
 
     pub(crate) fn show_workspace_dropdown(&mut self) {
@@ -2541,8 +2587,9 @@ impl TermWindow {
         let choices = crate::workspace::WorkspaceManager::new()
             .picker_names(&active)
             .into_iter()
-            .map(|workspace| InputSelectorEntry {
-                label: workspace.clone(),
+            .enumerate()
+            .map(|(index, workspace)| InputSelectorEntry {
+                label: format!("{}. {workspace}", index + 1),
                 id: Some(workspace),
             })
             .collect();
@@ -2561,8 +2608,19 @@ impl TermWindow {
     }
 
     pub(crate) fn show_input_selector(&mut self, args: &config::keyassignment::InputSelector) {
+        self.show_input_selector_with_filter(args, String::new());
+    }
+
+    pub(crate) fn show_input_selector_with_filter(
+        &mut self,
+        args: &config::keyassignment::InputSelector,
+        initial_filter: String,
+    ) {
         match crate::termwindow::native_modal::NativeInputSelector::new(self, args.clone()) {
-            Ok(modal) => {
+            Ok(mut modal) => {
+                if !initial_filter.is_empty() {
+                    modal.set_initial_filter(initial_filter);
+                }
                 self.set_modal(Rc::new(modal));
                 self.invalidate_modal();
             }
@@ -3113,6 +3171,7 @@ impl TermWindow {
             ShowTabNavigator => self.show_tab_navigator(),
             ShowDebugOverlay => self.show_debug_overlay(),
             ShowLauncher => self.show_launcher(),
+            ShowWorkspacePicker => self.show_workspace_dropdown(),
             ShowProjectWorkspacePicker => self.show_project_workspace_picker(),
             ShowLauncherArgs(args) => {
                 let title = args.title.clone().unwrap_or("Launcher".to_string());

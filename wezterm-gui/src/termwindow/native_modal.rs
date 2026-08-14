@@ -223,6 +223,12 @@ impl NativeInputSelector {
         })
     }
 
+    pub(crate) fn set_initial_filter(&mut self, filter: String) {
+        let mut view = self.view.borrow_mut();
+        view.filter = filter;
+        self.update_filter(&mut view);
+    }
+
     fn update_filter(&self, view: &mut SelectorView) {
         if view.filter.is_empty() {
             view.filtered = self.args.choices.clone();
@@ -355,6 +361,26 @@ impl Modal for NativeInputSelector {
         mods: KeyModifiers,
         term_window: &mut TermWindow,
     ) -> anyhow::Result<bool> {
+        if self.event_name == crate::workspace::WORKSPACE_PICKER_EVENT
+            && matches!(mods, KeyModifiers::NONE | KeyModifiers::SHIFT)
+        {
+            if let KeyCode::Char(c) = key {
+                if let Some(number) = c.to_digit(10) {
+                    let index = if number == 0 { 9 } else { number as usize - 1 };
+                    let entry = self.args.choices.get(index).cloned();
+                    if let Some(entry) = entry {
+                        self.finish(term_window, Some(entry));
+                    }
+                    return Ok(true);
+                }
+                if !c.is_control() {
+                    term_window.cancel_modal();
+                    term_window.show_project_workspace_picker_with_filter(c.to_string());
+                    return Ok(true);
+                }
+            }
+        }
+
         match (key, mods) {
             (KeyCode::Escape, KeyModifiers::NONE)
             | (KeyCode::Char('g'), KeyModifiers::CTRL)
@@ -435,7 +461,9 @@ impl Modal for NativeInputSelector {
                 .map(|entry| entry.label.chars().count())
                 .max()
                 .unwrap_or(20);
-            let footer = if self.delete_event_name.is_some() {
+            let footer = if self.event_name == crate::workspace::WORKSPACE_PICKER_EVENT {
+                "1-9 select   letters: projects   ↑↓ move   Esc close"
+            } else if self.delete_event_name.is_some() {
                 "↑↓ move   Enter select   Ctrl+D delete   Esc close"
             } else {
                 "↑↓ move   Enter select   Esc close"

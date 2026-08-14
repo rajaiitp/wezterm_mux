@@ -13,8 +13,8 @@ use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
 use ::window::{DeadKeyStatus, PointF, RectF, SizeF, WindowOps};
 use anyhow::{anyhow, Context};
 use config::{
-    BoldBrightening, ConfigHandle, DimensionContext, HorizontalWindowContentAlignment, TextStyle,
-    VerticalWindowContentAlignment, VisualBellTarget,
+    BoldBrightening, ConfigHandle, DimensionContext, HorizontalWindowContentAlignment, PanePadding,
+    TextStyle, VerticalWindowContentAlignment, VisualBellTarget,
 };
 use euclid::num::Zero;
 use mux::pane::{Pane, PaneId};
@@ -44,6 +44,8 @@ pub mod screen_line;
 pub mod split;
 pub mod tab_bar;
 pub mod window_buttons;
+
+pub const PANE_BORDER_THICKNESS: f32 = 2.0;
 
 /// The data that we associate with a line; we use this to cache it shape hash
 #[derive(Debug)]
@@ -103,6 +105,9 @@ pub struct LineToEleShapeCacheKey {
     /// shaped line elements, so opacity alone is insufficient for cache
     /// invalidation when active/inactive pane backgrounds differ.
     pub pane_background: LinearRgba,
+    /// Resolved pane font identity. Font styling is part of shaping and must
+    /// participate in cache invalidation when active state changes.
+    pub pane_font: Option<TextStyle>,
 }
 
 pub struct LineToElementShapeItem {
@@ -223,7 +228,11 @@ pub struct ComputeCellFgBgResult {
 #[derive(Clone, Debug)]
 pub struct ClusterStyleCache<'a> {
     attrs: &'a CellAttributes,
+    /// The matched style is retained for colors and other terminal styling.
     style: &'a TextStyle,
+    /// The inactive-pane font is derived per cluster so that its family and
+    /// base weight do not erase the cell's bold/half-bright/italic attributes.
+    pane_style: Option<TextStyle>,
     underline_tex_rect: TextureRect,
     fg_color: LinearRgba,
     bg_color: LinearRgba,
@@ -400,6 +409,87 @@ impl crate::TermWindow {
         };
 
         (padding_left + left_gap, padding_top + top_gap)
+    }
+
+    pub fn padding_left_top_right_bottom(&self) -> (f32, f32, f32, f32) {
+        let h_context = DimensionContext {
+            dpi: self.dimensions.dpi as f32,
+            pixel_max: self.terminal_size.pixel_width as f32,
+            pixel_cell: self.render_metrics.cell_size.width as f32,
+        };
+        let v_context = DimensionContext {
+            dpi: self.dimensions.dpi as f32,
+            pixel_max: self.terminal_size.pixel_height as f32,
+            pixel_cell: self.render_metrics.cell_size.height as f32,
+        };
+        let (padding_left, padding_top) = self.padding_left_top();
+        let base_left = self
+            .config
+            .window_padding
+            .left
+            .evaluate_as_pixels(h_context);
+        let base_top = self.config.window_padding.top.evaluate_as_pixels(v_context);
+        let base_right = if self.show_scroll_bar && self.config.window_padding.right.is_zero() {
+            h_context.pixel_cell
+        } else {
+            self.config
+                .window_padding
+                .right
+                .evaluate_as_pixels(h_context)
+        };
+        let base_bottom = self
+            .config
+            .window_padding
+            .bottom
+            .evaluate_as_pixels(v_context);
+        let horizontal_gap = self.dimensions.pixel_width as f32
+            - self.terminal_size.pixel_width as f32
+            - base_left
+            - base_right;
+        let vertical_gap = self.dimensions.pixel_height as f32
+            - self.terminal_size.pixel_height as f32
+            - base_top
+            - base_bottom
+            - if self.show_tab_bar {
+                self.tab_bar_pixel_height().unwrap_or(0.)
+            } else {
+                0.
+            };
+        let right_gap = horizontal_gap - (padding_left - base_left);
+        let bottom_gap = vertical_gap - (padding_top - base_top);
+        (
+            padding_left,
+            padding_top,
+            base_right + right_gap,
+            base_bottom + bottom_gap,
+        )
+    }
+
+    fn evaluate_pane_padding(&self, padding: &PanePadding) -> (f32, f32, f32, f32) {
+        let h_context = DimensionContext {
+            dpi: self.dimensions.dpi as f32,
+            pixel_max: self.terminal_size.pixel_width as f32,
+            pixel_cell: self.render_metrics.cell_size.width as f32,
+        };
+        let v_context = DimensionContext {
+            dpi: self.dimensions.dpi as f32,
+            pixel_max: self.terminal_size.pixel_height as f32,
+            pixel_cell: self.render_metrics.cell_size.height as f32,
+        };
+        (
+            padding.left.evaluate_as_pixels(h_context),
+            padding.top.evaluate_as_pixels(v_context),
+            padding.right.evaluate_as_pixels(h_context),
+            padding.bottom.evaluate_as_pixels(v_context),
+        )
+    }
+
+    pub fn pane_padding_pixels(&self) -> (f32, f32, f32, f32) {
+        self.evaluate_pane_padding(&self.config.pane_padding)
+    }
+
+    pub fn pane_content_padding_pixels(&self) -> (f32, f32, f32, f32) {
+        self.evaluate_pane_padding(&self.config.pane_content_padding)
     }
 
     fn resolve_lock_glyph(

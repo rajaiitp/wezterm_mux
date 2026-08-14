@@ -664,6 +664,7 @@ impl SessionHandler {
                 containing_tab_id,
                 pane_id,
                 size,
+                preserve_layout,
             }) => {
                 spawn_into_main_thread(async move {
                     catch(
@@ -673,10 +674,12 @@ impl SessionHandler {
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
                             pane.resize(size)?;
-                            let tab = mux
-                                .get_tab(containing_tab_id)
-                                .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
-                            tab.rebuild_splits_sizes_from_contained_panes();
+                            if !preserve_layout {
+                                let tab = mux
+                                    .get_tab(containing_tab_id)
+                                    .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
+                                tab.rebuild_splits_sizes_from_contained_panes();
+                            }
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,

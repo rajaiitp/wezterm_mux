@@ -599,6 +599,14 @@ pub struct Config {
     #[dynamic(default)]
     pub window_padding: WindowPadding,
 
+    /// Adds configurable per-side spacing between neighboring pane borders.
+    #[dynamic(default)]
+    pub pane_padding: PanePadding,
+
+    /// Adds configurable per-side insets between a pane border and its content.
+    #[dynamic(default)]
+    pub pane_content_padding: PanePadding,
+
     #[dynamic(default)]
     pub window_content_alignment: WindowContentAlignment,
 
@@ -678,6 +686,11 @@ pub struct Config {
     /// background and text colors remain independent.
     #[dynamic(default)]
     pub inactive_pane_background: Option<RgbaColor>,
+
+    /// Optional font style applied to inactive panes. When unset, inactive
+    /// panes use the normal terminal font style.
+    #[dynamic(default)]
+    pub inactive_pane_font: Option<TextStyle>,
 
     /// inactive_pane_hue, inactive_pane_saturation and
     /// inactive_pane_brightness allow for transforming the color
@@ -2041,6 +2054,29 @@ impl Default for WindowPadding {
             right: default_one_cell(),
             top: default_half_cell(),
             bottom: default_half_cell(),
+        }
+    }
+}
+
+#[derive(FromDynamic, ToDynamic, Clone, Copy, Debug)]
+pub struct PanePadding {
+    #[dynamic(try_from = "crate::units::PixelUnit", default)]
+    pub left: Dimension,
+    #[dynamic(try_from = "crate::units::PixelUnit", default)]
+    pub right: Dimension,
+    #[dynamic(try_from = "crate::units::PixelUnit", default)]
+    pub top: Dimension,
+    #[dynamic(try_from = "crate::units::PixelUnit", default)]
+    pub bottom: Dimension,
+}
+
+impl Default for PanePadding {
+    fn default() -> Self {
+        Self {
+            left: Dimension::default(),
+            right: Dimension::default(),
+            top: Dimension::default(),
+            bottom: Dimension::default(),
         }
     }
 }
