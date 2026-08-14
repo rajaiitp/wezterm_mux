@@ -30,8 +30,9 @@ use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
 use anyhow::{anyhow, ensure, Context};
 use config::keyassignment::{
-    AutomationClientCall, Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, Pattern,
-    PromptInputLine, QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
+    AutomationClientCall, Confirmation, InputSelector, InputSelectorEntry, KeyAssignment,
+    LauncherActionArgs, PaneDirection, Pattern, PromptInputLine, QuickSelectArguments,
+    RotationDirection, SpawnCommand, SplitSize,
 };
 use config::window::WindowLevel;
 use config::{
@@ -995,7 +996,7 @@ impl TermWindow {
             myself.emit_status_event();
             // The initial status event can run before the native tab-bar state
             // has been painted. Render the title/status bar once explicitly so
-            // workspace pills are present immediately on startup.
+            // workspace status is present immediately on startup.
             myself.update_title();
         }
 
@@ -1726,12 +1727,7 @@ impl TermWindow {
         let mut offset = 1;
         self.right_status_click_targets.clear();
         for workspace in workspaces {
-            let label = if workspace == "default" {
-                "0"
-            } else {
-                workspace.as_str()
-            };
-            let segment = format!("   󱂬  {label}   ");
+            let segment = format!("  {workspace}  ");
             let width = wezterm_term::unicode_column_width(&segment, None);
             let end = offset + width + 1;
             self.right_status_click_targets
@@ -2228,8 +2224,8 @@ impl TermWindow {
         }
         // A title/status update can happen before the first frame is painted;
         // if the tab-bar state is already equal, the change still needs an
-        // explicit repaint. This is especially important for the startup
-        // workspace pills, which otherwise appear only after another UI event.
+        // explicit repaint. This is especially important for startup workspace
+        // status, which otherwise appears only after another UI event.
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
@@ -2503,7 +2499,68 @@ impl TermWindow {
         Ok(())
     }
 
-    fn show_input_selector(&mut self, args: &config::keyassignment::InputSelector) {
+    fn show_project_workspace_picker(&mut self) {
+        let catalog = crate::project_workspace::discover_projects(&self.config);
+        let choices = catalog
+            .entries()
+            .iter()
+            .map(|entry| InputSelectorEntry {
+                label: format!(
+                    "{}  {}",
+                    entry
+                        .project
+                        .primary_root
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("project"),
+                    entry.project.primary_root.display()
+                ),
+                id: Some(entry.project.primary_root.to_string_lossy().into_owned()),
+            })
+            .collect::<Vec<_>>();
+        if choices.is_empty() {
+            log::warn!("project workspace picker found no Git repositories");
+            return;
+        }
+        self.show_input_selector(&InputSelector {
+            action: Box::new(KeyAssignment::EmitEvent(
+                crate::project_workspace::PROJECT_EVENT.to_string(),
+            )),
+            title: "Project workspace".to_string(),
+            choices,
+            fuzzy: true,
+            alphabet: Default::default(),
+            description: Default::default(),
+            fuzzy_description: Default::default(),
+            delete_action: None,
+        });
+    }
+
+    pub(crate) fn show_workspace_dropdown(&mut self) {
+        let active = Mux::get().active_workspace();
+        let choices = crate::workspace::WorkspaceManager::new()
+            .picker_names(&active)
+            .into_iter()
+            .map(|workspace| InputSelectorEntry {
+                label: workspace.clone(),
+                id: Some(workspace),
+            })
+            .collect();
+        self.show_input_selector(&InputSelector {
+            action: Box::new(KeyAssignment::EmitEvent(
+                crate::workspace::WORKSPACE_PICKER_EVENT.to_string(),
+            )),
+            title: "Workspace".to_string(),
+            choices,
+            fuzzy: true,
+            alphabet: Default::default(),
+            description: Default::default(),
+            fuzzy_description: Default::default(),
+            delete_action: None,
+        });
+    }
+
+    pub(crate) fn show_input_selector(&mut self, args: &config::keyassignment::InputSelector) {
         match crate::termwindow::native_modal::NativeInputSelector::new(self, args.clone()) {
             Ok(modal) => {
                 self.set_modal(Rc::new(modal));
@@ -2513,7 +2570,7 @@ impl TermWindow {
         }
     }
 
-    fn show_prompt_input_line(&mut self, args: &PromptInputLine) {
+    pub(crate) fn show_prompt_input_line(&mut self, args: &PromptInputLine) {
         match crate::termwindow::native_modal::NativePromptInput::new(self, args.clone()) {
             Ok(modal) => {
                 self.set_modal(Rc::new(modal));
@@ -3056,6 +3113,7 @@ impl TermWindow {
             ShowTabNavigator => self.show_tab_navigator(),
             ShowDebugOverlay => self.show_debug_overlay(),
             ShowLauncher => self.show_launcher(),
+            ShowProjectWorkspacePicker => self.show_project_workspace_picker(),
             ShowLauncherArgs(args) => {
                 let title = args.title.clone().unwrap_or("Launcher".to_string());
                 let args = LauncherActionArgs {

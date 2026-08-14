@@ -102,6 +102,7 @@ wezterm-gui-subcommands.workspace = true
 wezterm-mux-server-impl.workspace = true
 wezterm-session-state.workspace = true
 wezterm-open-url.workspace = true
+wezterm-project-workspace.workspace = true
 wezterm-ssh.workspace = true
 wezterm-term.workspace = true
 wezterm-toast-notification.workspace = true

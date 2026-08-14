@@ -1,0 +1,16 @@
+[package]
+name = "wezterm-project-workspace"
+version = "0.1.0"
+authors = ["Wez Furlong <wez@wezfurlong.org>"]
+edition = "2018"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+dirs-next.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

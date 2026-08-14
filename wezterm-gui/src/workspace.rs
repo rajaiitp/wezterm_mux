@@ -1,3 +1,4 @@
+use config::keyassignment::InputSelectorEntry;
 use mux::window::WindowId;
 use mux::Mux;
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,7 @@ use termwiz::cell::{AttributeChange, Intensity};
 use termwiz_funcs::{format_as_escapes, FormatColor, FormatItem};
 
 pub const DEFAULT_WORKSPACE: &str = "default";
-const WORKSPACE_ICON: &str = "󱂬";
+pub const WORKSPACE_PICKER_EVENT: &str = "__wezterm_workspace_picker";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct LastTab {
@@ -47,6 +48,15 @@ pub struct WorkspaceManager {
 
 pub fn ordered_workspace_names() -> Vec<String> {
     WorkspaceManager::new().display_names()
+}
+
+pub fn select_workspace(entry: Option<InputSelectorEntry>) {
+    let Some(workspace) = entry.and_then(|entry| entry.id) else {
+        return;
+    };
+    if workspace_is_live(&workspace) {
+        crate::frontend::front_end().switch_workspace(&workspace, false);
+    }
 }
 
 impl WorkspaceManager {
@@ -201,45 +211,41 @@ impl WorkspaceManager {
     }
 
     pub fn status(&mut self, active: &str) -> (String, Vec<String>) {
-        let names = self.display_names();
+        let active = if active.is_empty() {
+            DEFAULT_WORKSPACE
+        } else {
+            active
+        };
+        let names = vec![active.to_string()];
         log::trace!(
             "workspace manager active={} ordered={:?} previous={:?}",
             active,
-            names,
+            self.display_names(),
             self.previous,
         );
-        let mut items = vec![
+        let items = vec![
+            FormatItem::Background(FormatColor::Color("#1d2021".to_string())),
+            FormatItem::Text(" ".to_string()),
+            FormatItem::Background(FormatColor::Color("#83a598".to_string())),
+            FormatItem::Foreground(FormatColor::Color("#1d2021".to_string())),
+            FormatItem::Attribute(AttributeChange::Intensity(Intensity::Bold)),
+            FormatItem::Text(format!("  {active}  ")),
+            FormatItem::Attribute(AttributeChange::Intensity(Intensity::Normal)),
             FormatItem::Background(FormatColor::Color("#1d2021".to_string())),
             FormatItem::Text(" ".to_string()),
         ];
 
-        for name in &names {
-            let is_active = name == active;
-            items.push(FormatItem::Background(FormatColor::Color(
-                if is_active { "#83a598" } else { "#504945" }.to_string(),
-            )));
-            items.push(FormatItem::Foreground(FormatColor::Color(
-                if is_active { "#1d2021" } else { "#ebdbb2" }.to_string(),
-            )));
-            items.push(FormatItem::Attribute(AttributeChange::Intensity(
-                if is_active {
-                    Intensity::Bold
-                } else {
-                    Intensity::Normal
-                },
-            )));
-            items.push(FormatItem::Text(format!("   {WORKSPACE_ICON}  {name}   ")));
-            items.push(FormatItem::Attribute(AttributeChange::Intensity(
-                Intensity::Normal,
-            )));
-            items.push(FormatItem::Background(FormatColor::Color(
-                "#1d2021".to_string(),
-            )));
-            items.push(FormatItem::Text(" ".to_string()));
-        }
-
         let status = format_as_escapes(items).unwrap_or_default();
         (status, names)
+    }
+
+    pub fn picker_names(&mut self, active: &str) -> Vec<String> {
+        let mut names = vec![DEFAULT_WORKSPACE.to_string()];
+        names.extend(self.display_names());
+        if !names.iter().any(|name| name == active) && workspace_is_live(active) {
+            names.push(active.to_string());
+        }
+        names
     }
 
     fn sync_order(&mut self) {

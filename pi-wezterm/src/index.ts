@@ -11,6 +11,11 @@ const MUX_SOCKET = process.env.WEZTERM_UNIX_SOCKET;
 const SOCKET = process.env.WEZTERM_AUTOMATION_SOCKET
   ?? (MUX_SOCKET ? `${MUX_SOCKET}.automation` : undefined);
 const PANE_ID = Number.parseInt(process.env.WEZTERM_PANE ?? "", 10);
+const WORKSPACE_ID = process.env.WEZTERM_DEV_WORKSPACE_ID;
+const PROJECT_ID = process.env.WEZTERM_PROJECT_ID;
+const PROJECT_ROOT = process.env.WEZTERM_PROJECT_ROOT;
+const WORKTREE_ROOT = process.env.WEZTERM_WORKTREE_ROOT;
+const PANE_ROLE = process.env.WEZTERM_PANE_ROLE;
 const EXTENSION_ID = "pi-wezterm";
 
 type PiContext = {
@@ -24,6 +29,11 @@ type PiHost = {
   registerTool: (tool: unknown) => void;
   on: (event: string, handler: (...args: unknown[]) => void) => void;
   sendUserMessage: (message: string, options?: { deliverAs?: string }) => void;
+  exec: (
+    command: string,
+    args: string[],
+    options?: { signal?: AbortSignal },
+  ) => Promise<{ stdout: string; stderr: string; code: number | null }>;
 };
 
 type CommandResponse = {
@@ -174,6 +184,60 @@ export default function (pi: PiHost) {
     });
 
     pi.registerTool({
+      name: "review_comments",
+      label: "Read Review Comments",
+      description:
+        "List persisted tuicr review sessions or read saved user comments for a specified session in the current development worktree.",
+      parameters: Type.Object({
+        session: Type.Optional(Type.String({ description: "tuicr session slug" })),
+      }),
+      async execute(
+        _toolCallId: string,
+        params: JsonRecord,
+        signal: AbortSignal | undefined,
+      ) {
+        const args = params.session
+          ? [
+              "review",
+              "comments",
+              "--repo",
+              WORKTREE_ROOT ?? process.cwd(),
+              "--session",
+              String(params.session),
+            ]
+          : ["review", "list", "--repo", WORKTREE_ROOT ?? process.cwd()];
+        const response = await pi.exec("tuicr", args, { signal });
+        if (response.code !== 0) {
+          throw new Error(response.stderr || `tuicr exited with code ${response.code}`);
+        }
+        return {
+          content: [{ type: "text", text: response.stdout }],
+          details: { session: params.session ?? null, output: response.stdout },
+        };
+      },
+    });
+
+    pi.registerTool({
+      name: "terminal_context",
+      label: "Development Workspace Context",
+      description:
+        "Return the current native WezTerm development workspace, project, worktree, pane role, and automation connection metadata.",
+      parameters: Type.Object({}),
+      async execute() {
+        return result({
+          workspaceId: WORKSPACE_ID ?? null,
+          projectId: PROJECT_ID ?? null,
+          projectRoot: PROJECT_ROOT ?? null,
+          worktreeRoot: WORKTREE_ROOT ?? process.cwd(),
+          paneRole: PANE_ROLE ?? null,
+          paneId: PANE_ID,
+          socket: SOCKET ?? null,
+          connected: client?.connected ?? false,
+        });
+      },
+    });
+
+    pi.registerTool({
       name: "terminal_run",
       label: "Run Terminal Command",
       description:
@@ -279,6 +343,13 @@ export default function (pi: PiHost) {
     // Connect lazily on the first tool call. The persistent mux/automation
     // listener may still be starting when Pi loads its extensions.
     ctxRef = ctx as PiContext;
+    const workspace = WORKSPACE_ID ? `workspace ${WORKSPACE_ID}` : "workspace";
+    const role = PANE_ROLE ? ` · ${PANE_ROLE}` : "";
+    try {
+      (ctx as PiContext).ui?.setStatus?.("workspace", `${workspace}${role}`);
+    } catch {
+      // Ignore status callbacks from a retired Pi context.
+    }
   });
 
   pi.on("session_shutdown", () => {

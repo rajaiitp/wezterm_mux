@@ -44,6 +44,7 @@ mod inputmap;
 #[cfg(feature = "native_session_legacy")]
 mod native_session;
 mod overlay;
+mod project_workspace;
 mod quad;
 mod renderstate;
 mod resize_increment_calculator;

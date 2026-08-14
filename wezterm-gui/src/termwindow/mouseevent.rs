@@ -1,4 +1,3 @@
-use crate::frontend::front_end;
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
     GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
@@ -564,10 +563,8 @@ impl super::TermWindow {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
                 TabBarItem::RightStatus => {
-                    if let Some(workspace) = self.workspace_at_right_status(&ui_item) {
-                        if Mux::get().active_workspace() != workspace {
-                            front_end().switch_workspace(&workspace, false);
-                        }
+                    if self.workspace_at_right_status(&ui_item).is_some() {
+                        self.show_workspace_dropdown();
                     }
                 }
                 TabBarItem::None | TabBarItem::LeftStatus => {

@@ -14,7 +14,9 @@ ln -sf "$PWD/src/protocol.ts" ~/.pi/agent/extensions/pi-wezterm/protocol.ts
 
 The extension activates only when WezTerm provides `WEZTERM_AUTOMATION_SOCKET`.
 The WezTerm mux server injects that variable together with `WEZTERM_PANE` into
-new panes.
+new panes. The native project-workspace picker also exports
+`WEZTERM_DEV_WORKSPACE_ID`, `WEZTERM_PROJECT_ID`, `WEZTERM_PROJECT_ROOT`,
+`WEZTERM_WORKTREE_ROOT`, and `WEZTERM_PANE_ROLE`.
 
 ## Local build replacement
 
@@ -29,8 +31,12 @@ mux processes keep their old mapped binaries until they are restarted.
 
 ## Tools
 
-The extension exposes a small command interface: `terminal_run`,
-`terminal_read`, `terminal_command`, and `terminal_input`. Pi receives an
+The extension exposes `terminal_context`, `review_comments`, and a small
+command interface: `terminal_run`, `terminal_read`, `terminal_command`, and
+`terminal_input`. `terminal_context` reports the native development-workspace
+ID, project/worktree paths, semantic pane role, and automation connection
+state. `review_comments` lists tuicr sessions or reads saved user comments for
+a supplied session slug. Pi receives an
 opaque command ID plus a concise `$ ...` display line showing the exact
 argv/cwd that was started; pane, tab, window, and pool identity stay inside the
 mux plugin.

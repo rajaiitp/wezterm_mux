@@ -256,6 +256,18 @@ impl NativeInputSelector {
         entry: Option<InputSelectorEntry>,
     ) {
         term_window.cancel_modal();
+        if event_name == crate::project_workspace::PROJECT_EVENT {
+            crate::project_workspace::select_project(term_window, entry);
+            return;
+        }
+        if event_name == crate::project_workspace::WORKTREE_EVENT {
+            crate::project_workspace::select_worktree(term_window, entry);
+            return;
+        }
+        if event_name == crate::workspace::WORKSPACE_PICKER_EVENT {
+            crate::workspace::select_workspace(entry);
+            return;
+        }
         crate::overlay::selector::trampoline(
             event_name,
             self.window.clone(),
@@ -546,6 +558,20 @@ impl NativePromptInput {
 
     fn finish(&self, term_window: &mut TermWindow, line: Option<String>) {
         term_window.cancel_modal();
+        if let Some(project_path) = self
+            .event_name
+            .strip_prefix(crate::project_workspace::BRANCH_EVENT_PREFIX)
+        {
+            crate::project_workspace::select_new_branch(project_path, line);
+            return;
+        }
+        if let Some(project_path) = self
+            .event_name
+            .strip_prefix(crate::project_workspace::EXISTING_BRANCH_EVENT_PREFIX)
+        {
+            crate::project_workspace::select_existing_branch(project_path, line);
+            return;
+        }
         crate::overlay::prompt::trampoline(
             self.event_name.clone(),
             self.window.clone(),

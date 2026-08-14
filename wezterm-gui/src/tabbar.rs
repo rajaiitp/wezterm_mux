@@ -492,7 +492,7 @@ impl TabBarState {
 
         // Reserve room for both status regions before sizing tabs. Without
         // this, a long tab/title set can consume the entire initial width and
-        // the right-side workspace pills are rendered past the window edge.
+        // the right-side workspace status is rendered past the window edge.
         let left_status_width = parse_status_text(left_status, CellAttributes::default()).len();
         let right_status_width = parse_status_text(right_status, CellAttributes::default())
             .len()

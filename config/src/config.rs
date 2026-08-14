@@ -48,6 +48,57 @@ use wezterm_input_types::{
 };
 use wezterm_term::TerminalSize;
 
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct ProjectWorkspaceConfig {
+    /// Enable the native project/worktree picker.
+    #[dynamic(default = "default_true")]
+    pub enabled: bool,
+
+    /// Roots to scan for Git projects. Symlinks are not traversed.
+    #[dynamic(default)]
+    pub roots: Vec<PathBuf>,
+
+    /// Maximum directory depth when scanning configured roots.
+    #[dynamic(default = "default_project_scan_depth")]
+    pub scan_depth: usize,
+
+    /// Enrich project discovery with zoxide when it is installed.
+    #[dynamic(default = "default_true")]
+    pub use_zoxide: bool,
+
+    /// Central location for newly-created linked worktrees.
+    #[dynamic(default)]
+    pub worktree_root: Option<PathBuf>,
+
+    /// Directory names excluded from project discovery.
+    #[dynamic(default = "default_project_exclusions")]
+    pub excluded_directories: Vec<String>,
+}
+
+impl Default for ProjectWorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            roots: Vec::new(),
+            scan_depth: default_project_scan_depth(),
+            use_zoxide: true,
+            worktree_root: None,
+            excluded_directories: default_project_exclusions(),
+        }
+    }
+}
+
+fn default_project_scan_depth() -> usize {
+    3
+}
+
+fn default_project_exclusions() -> Vec<String> {
+    [".git", "node_modules", "target", ".cache", "build", "dist"]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
 pub struct Config {
     /// The font size, measured in points
@@ -105,6 +156,10 @@ pub struct Config {
 
     #[dynamic(default)]
     pub color_scheme_dirs: Vec<PathBuf>,
+
+    /// Native project/worktree workspace configuration.
+    #[dynamic(default)]
+    pub project_workspaces: ProjectWorkspaceConfig,
 
     /// The DPI to assume
     pub dpi: Option<f64>,

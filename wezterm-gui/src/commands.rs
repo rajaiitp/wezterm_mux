@@ -1639,6 +1639,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Shell"],
             icon: None,
         },
+        ShowProjectWorkspacePicker => CommandDef {
+            brief: "Open project workspace picker".into(),
+            doc: "Choose a project and Git worktree for an integrated development workspace".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Shell"],
+            icon: Some("cod_list_selection"),
+        },
         ShowTabNavigator => CommandDef {
             brief: "Navigate tabs".into(),
             doc: "Shows the tab navigator".into(),

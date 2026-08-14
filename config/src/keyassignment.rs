@@ -599,6 +599,8 @@ pub enum KeyAssignment {
     SplitHorizontal(SpawnCommand),
     SplitVertical(SpawnCommand),
     ShowLauncher,
+    /// Open the native project/worktree workspace picker.
+    ShowProjectWorkspacePicker,
     ShowLauncherArgs(LauncherActionArgs),
     ClearScrollback(ScrollbackEraseMode),
     Search(Pattern),

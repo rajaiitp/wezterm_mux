@@ -7167,6 +7167,7 @@ dependencies = [
  "wezterm-gui-subcommands",
  "wezterm-mux-server-impl",
  "wezterm-open-url",
+ "wezterm-project-workspace",
  "wezterm-session-state",
  "wezterm-ssh",
  "wezterm-term",
@@ -7262,6 +7263,18 @@ name = "wezterm-open-url"
 version = "0.1.0"
 dependencies = [
  "winapi",
+]
+
+[[package]]
+name = "wezterm-project-workspace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs-next",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
