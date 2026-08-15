@@ -281,7 +281,10 @@ impl GuiFrontEnd {
                     match mux
                         .spawn_tab_or_window(
                             window_id,
-                            SpawnTabDomain::DomainName("local".to_string()),
+                            // Scripts launched by the GUI must also use the
+                            // detachable persistent domain; never create a
+                            // GUI-local pane behind the user's back.
+                            SpawnTabDomain::DomainName("persistent".to_string()),
                             cmd,
                             cwd,
                             TerminalSize::default(),
@@ -316,14 +319,7 @@ impl GuiFrontEnd {
                         config.initial_size(dpi as u32, crate::cell_pixel_dims(&config, dpi).ok());
                     let term_config = Arc::new(config::TermConfig::with_config(config));
 
-                    crate::spawn::spawn_command_impl(
-                        spawn,
-                        spawn_where,
-                        size,
-                        None,
-                        term_config,
-                        None,
-                    )
+                    crate::spawn::spawn_command_impl(spawn, spawn_where, size, None, term_config)
                 }
 
                 match action {

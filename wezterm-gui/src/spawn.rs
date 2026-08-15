@@ -18,40 +18,18 @@ pub enum SpawnWhere {
     SplitPane(SplitRequest),
 }
 
-fn content_size(size: TerminalSize, (removed_cols, removed_rows): (usize, usize)) -> TerminalSize {
-    let cols = size.cols.saturating_sub(removed_cols).max(1);
-    let rows = size.rows.saturating_sub(removed_rows).max(1);
-    let cell_width = size.pixel_width.checked_div(size.cols.max(1)).unwrap_or(0);
-    let cell_height = size.pixel_height.checked_div(size.rows.max(1)).unwrap_or(0);
-    TerminalSize {
-        cols,
-        rows,
-        pixel_width: cols * cell_width,
-        pixel_height: rows * cell_height,
-        dpi: size.dpi,
-    }
-}
-
 pub fn spawn_command_impl(
     spawn: &SpawnCommand,
     spawn_where: SpawnWhere,
     size: TerminalSize,
     src_window_id: Option<MuxWindowId>,
     term_config: Arc<TermConfig>,
-    content_padding: Option<(usize, usize)>,
 ) {
     let spawn = spawn.clone();
 
     promise::spawn::spawn(async move {
-        if let Err(err) = spawn_command_internal(
-            spawn,
-            spawn_where,
-            size,
-            src_window_id,
-            term_config,
-            content_padding,
-        )
-        .await
+        if let Err(err) =
+            spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config).await
         {
             log::error!("Failed to spawn: {:#}", err);
         }
@@ -121,7 +99,6 @@ pub async fn spawn_command_internal(
     size: TerminalSize,
     src_window_id: Option<MuxWindowId>,
     term_config: Arc<TermConfig>,
-    content_padding: Option<(usize, usize)>,
 ) -> anyhow::Result<()> {
     let mux = Mux::get();
     let activity = Activity::new();
@@ -184,7 +161,7 @@ pub async fn spawn_command_internal(
                     .ok_or_else(|| anyhow!("tab to have a pane"))?;
 
                 log::trace!("doing split_pane");
-                let (pane, pane_size) = mux
+                let (pane, _pane_size) = mux
                     .split_pane(
                         // tab.tab_id(),
                         pane.pane_id(),
@@ -198,15 +175,12 @@ pub async fn spawn_command_internal(
                     .await
                     .context("split_pane")?;
                 pane.set_config(term_config.clone());
-                if let Some(content_padding) = content_padding {
-                    pane.resize_preserving_layout(content_size(pane_size, content_padding))?;
-                }
             } else {
                 bail!("there is no active tab while splitting pane!?");
             }
         }
         _ => {
-            let (tab, pane, window_id) = mux
+            let (_tab, pane, window_id) = mux
                 .spawn_tab_or_window(
                     match spawn_where {
                         SpawnWhere::NewWindow => None,
@@ -228,9 +202,6 @@ pub async fn spawn_command_internal(
             // the new window being created.
             if Some(window_id) == src_window_id {
                 pane.set_config(term_config.clone());
-            }
-            if let Some(content_padding) = content_padding {
-                pane.resize_preserving_layout(content_size(tab.get_size(), content_padding))?;
             }
         }
     };

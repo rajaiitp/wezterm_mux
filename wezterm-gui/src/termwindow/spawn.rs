@@ -17,7 +17,6 @@ impl super::TermWindow {
             self.terminal_size
         };
         let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
-        let content_padding = self.pane_content_padding_cells();
 
         crate::spawn::spawn_command_impl(
             spawn,
@@ -25,7 +24,6 @@ impl super::TermWindow {
             size,
             Some(self.mux_window_id),
             term_config,
-            Some(content_padding),
         )
     }
 

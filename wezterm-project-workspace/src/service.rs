@@ -92,7 +92,9 @@ pub fn plan_workspace(request: &WorkspaceRequest) -> anyhow::Result<WorkspacePla
     let label = request.label.clone().unwrap_or_else(|| {
         branch
             .as_deref()
-            .map(|branch| format!("{project_name} · {branch}"))
+            // The label doubles as the mux workspace name, so use the same
+            // human-readable `project : branch` form that the tab bar shows.
+            .map(|branch| format!("{project_name} : {branch}"))
             .unwrap_or_else(|| project_name.to_string())
     });
 
@@ -183,7 +185,64 @@ mod tests {
             fs::canonicalize(repo).unwrap()
         );
         assert!(plan.worktree_mutation.is_none());
+        assert_eq!(plan.descriptor.label, "repo : main");
         assert_eq!(plan.descriptor.lifecycle, Lifecycle::Incomplete);
+    }
+
+    #[test]
+    fn plans_existing_branch_worktree_without_mutating_git() {
+        let (_dir, repo) = repository();
+        run_git(&repo, &["branch", "feature/existing"]);
+        let managed_root = repo.parent().unwrap().join("worktrees");
+        let request = WorkspaceRequest {
+            project_path: repo.clone(),
+            selection: WorktreeSelection::ExistingBranch {
+                branch: "feature/existing".to_string(),
+            },
+            managed_root: managed_root.clone(),
+            label: None,
+            profile: LayoutProfile::default_agentic(),
+        };
+        let plan = plan_workspace(&request).unwrap();
+        assert_eq!(plan.descriptor.branch.as_deref(), Some("feature/existing"));
+        assert_eq!(plan.descriptor.label, "repo : feature/existing");
+        assert!(plan.descriptor.managed);
+        assert_eq!(plan.worktree_mutation.as_ref().unwrap().base_ref, None);
+        assert!(!plan.descriptor.worktree_path.exists());
+    }
+
+    #[test]
+    fn plans_existing_worktree_without_creating_another() {
+        let (_dir, repo) = repository();
+        let existing = repo.parent().unwrap().join("checked-out");
+        run_git(&repo, &["branch", "feature/checked-out"]);
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                existing.to_str().unwrap(),
+                "feature/checked-out",
+            ],
+        );
+        let request = WorkspaceRequest {
+            project_path: repo.clone(),
+            selection: WorktreeSelection::Existing(existing.clone()),
+            managed_root: repo.parent().unwrap().join("worktrees"),
+            label: None,
+            profile: LayoutProfile::default_agentic(),
+        };
+        let plan = plan_workspace(&request).unwrap();
+        assert_eq!(
+            plan.descriptor.worktree_path,
+            fs::canonicalize(existing).unwrap()
+        );
+        assert_eq!(
+            plan.descriptor.branch.as_deref(),
+            Some("feature/checked-out")
+        );
+        assert_eq!(plan.descriptor.label, "repo : feature/checked-out");
+        assert!(plan.worktree_mutation.is_none());
     }
 
     #[test]

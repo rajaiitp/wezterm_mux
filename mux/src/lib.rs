@@ -1,5 +1,6 @@
 use crate::client::{ClientId, ClientInfo};
 use crate::pane::{CachePolicy, Pane, PaneId};
+use crate::renderable::RenderableDimensions;
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::window::{Window, WindowId};
@@ -1479,17 +1480,17 @@ impl Mux {
             pane.set_config(config);
         }
 
+        // Domain::split_pane registers the new pane before inserting it into
+        // the tab so that remote panes can be tracked during the operation.
+        // Publish a second layout notification after insertion; GUI clients
+        // must not reconcile pane content sizes against the pre-split tree.
+        self.notify(MuxNotification::TabResized(tab_id));
+
         // FIXME: clipboard
 
         let dims = pane.get_dimensions();
 
-        let size = TerminalSize {
-            cols: dims.cols,
-            rows: dims.viewport_rows,
-            pixel_height: 0, // FIXME: split pane pixel dimensions
-            pixel_width: 0,
-            dpi: dims.dpi,
-        };
+        let size = terminal_size_from_pane_dimensions(dims);
 
         Ok((pane, size))
     }
@@ -1709,6 +1710,16 @@ pub enum SessionTerminated {
     WindowClosed,
 }
 
+fn terminal_size_from_pane_dimensions(dims: RenderableDimensions) -> TerminalSize {
+    TerminalSize {
+        cols: dims.cols,
+        rows: dims.viewport_rows,
+        pixel_height: dims.pixel_height,
+        pixel_width: dims.pixel_width,
+        dpi: dims.dpi,
+    }
+}
+
 pub(crate) fn terminal_size_to_pty_size(size: TerminalSize) -> anyhow::Result<PtySize> {
     Ok(PtySize {
         rows: size.rows.try_into()?,
@@ -1716,6 +1727,30 @@ pub(crate) fn terminal_size_to_pty_size(size: TerminalSize) -> anyhow::Result<Pt
         pixel_height: size.pixel_height.try_into()?,
         pixel_width: size.pixel_width.try_into()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_size_from_pane_dimensions;
+    use crate::renderable::RenderableDimensions;
+
+    #[test]
+    fn split_response_preserves_pane_pixel_dimensions() {
+        let size = terminal_size_from_pane_dimensions(RenderableDimensions {
+            cols: 71,
+            viewport_rows: 29,
+            pixel_width: 639,
+            pixel_height: 638,
+            dpi: 96,
+            ..Default::default()
+        });
+
+        assert_eq!(size.cols, 71);
+        assert_eq!(size.rows, 29);
+        assert_eq!(size.pixel_width, 639);
+        assert_eq!(size.pixel_height, 638);
+        assert_eq!(size.dpi, 96);
+    }
 }
 
 struct MuxClipboard {

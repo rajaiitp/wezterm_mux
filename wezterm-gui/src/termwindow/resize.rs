@@ -13,6 +13,22 @@ pub struct RowsAndCols {
     pub cols: usize,
 }
 
+/// Return the PTY dimensions for a pane whose rendered content has an inset.
+/// The split tree keeps the full pane rectangle; only the terminal content is
+/// reduced. Keeping this arithmetic centralized makes every spawn, split, and
+/// resize path use the same contract.
+pub(crate) fn pane_content_dimensions(
+    pane_width: usize,
+    pane_height: usize,
+    removed_cols: usize,
+    removed_rows: usize,
+) -> (usize, usize) {
+    (
+        pane_width.saturating_sub(removed_cols).max(1),
+        pane_height.saturating_sub(removed_rows).max(1),
+    )
+}
+
 #[derive(Debug)]
 pub enum ScaleChange {
     Absolute(f64),
@@ -45,12 +61,13 @@ impl super::TermWindow {
             log::trace!("ignoring resize while closing the GUI window");
             return;
         }
+        // `new_window` can seed `self.dimensions` from the screen before
+        // Wayland sends its first configure. Even when the two rectangles are
+        // identical, that first configure is the only opportunity to resize
+        // restored 80x24 tabs to the compositor-owned geometry.
+        let first_resize = !self.has_received_resize;
         self.has_received_resize = true;
-        if self.dimensions == dimensions && self.window_state == window_state {
-            // The first compositor configure can report the requested size
-            // unchanged. Still rebuild the title/status bar: native workspace
-            // pills may have been rendered before the window had its final
-            // configured dimensions.
+        if !first_resize && self.dimensions == dimensions && self.window_state == window_state {
             log::trace!("dimensions didn't change; refreshing title/status");
             self.update_title();
             return;
@@ -304,7 +321,19 @@ impl super::TermWindow {
         let mux = Mux::get();
         if let Some(window) = mux.get_window(self.mux_window_id) {
             for tab in window.iter() {
-                tab.resize_layout(size);
+                let tab_size = tab.get_size();
+                if self.initial_tabs_needing_resize.remove(&tab.tab_id())
+                    || tab_size.rows != size.rows
+                    || tab_size.cols != size.cols
+                {
+                    // Keep the mux tab root synchronized with the compositor
+                    // before content padding shrinks individual PTYs.
+                    tab.resize(size);
+                } else {
+                    // Existing tabs with the correct root geometry use the
+                    // layout-only path; content padding owns leaf sizes.
+                    tab.resize_layout(size);
+                }
             }
         };
         // Resize pane content before the next frame is painted. Doing this in
@@ -376,8 +405,8 @@ impl super::TermWindow {
 
         for tab in window.iter() {
             for pos in tab.iter_panes_ignoring_zoom() {
-                let target_cols = pos.width.saturating_sub(removed_cols).max(1);
-                let target_rows = pos.height.saturating_sub(removed_rows).max(1);
+                let (target_cols, target_rows) =
+                    pane_content_dimensions(pos.width, pos.height, removed_cols, removed_rows);
                 let current = pos.pane.get_dimensions();
                 if current.cols == target_cols && current.viewport_rows == target_rows {
                     continue;
@@ -629,5 +658,22 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
         context.pixel_cell as usize
     } else {
         config.window_padding.right.evaluate_as_pixels(context) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pane_content_dimensions;
+
+    #[test]
+    fn content_insets_apply_to_both_split_axes() {
+        assert_eq!(pane_content_dimensions(80, 24, 1, 1), (79, 23));
+        assert_eq!(pane_content_dimensions(40, 12, 1, 1), (39, 11));
+    }
+
+    #[test]
+    fn content_insets_never_create_zero_sized_terminals() {
+        assert_eq!(pane_content_dimensions(0, 0, 4, 4), (1, 1));
+        assert_eq!(pane_content_dimensions(1, 1, 4, 4), (1, 1));
     }
 }

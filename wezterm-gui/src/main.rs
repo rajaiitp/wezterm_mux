@@ -540,21 +540,28 @@ enum Publish {
     NoConnectButPublish,
 }
 
+fn publish_is_allowed(
+    mux_default_domain: &str,
+    configured_default_domain: Option<&str>,
+    always_new_process: bool,
+    config_overridden: bool,
+) -> bool {
+    mux_default_domain == configured_default_domain.unwrap_or("local")
+        && !always_new_process
+        && !config_overridden
+}
+
 impl Publish {
     pub fn resolve(mux: &Arc<Mux>, config: &ConfigHandle, always_new_process: bool) -> Self {
-        if mux.default_domain().domain_name() != config.default_domain.as_deref().unwrap_or("local")
-        {
-            return Self::NoConnectNoPublish;
-        }
-
-        if always_new_process {
-            return Self::NoConnectNoPublish;
-        }
-
-        if config::is_config_overridden() {
-            // They're using a specific config file: assume that it is
-            // different from the running gui
-            log::trace!("skip existing gui: config is different");
+        if !publish_is_allowed(
+            mux.default_domain().domain_name(),
+            config.default_domain.as_deref(),
+            always_new_process,
+            config::is_config_overridden(),
+        ) {
+            // A different config, explicit --always-new-process, or a
+            // different default domain may legitimately represent another
+            // GUI instance.
             return Self::NoConnectNoPublish;
         }
 
@@ -687,6 +694,51 @@ impl Publish {
         } else {
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::publish_is_allowed;
+
+    #[test]
+    fn normal_persistent_start_can_reuse_existing_gui() {
+        assert!(publish_is_allowed(
+            "persistent",
+            Some("persistent"),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn explicit_new_process_bypasses_reuse() {
+        assert!(!publish_is_allowed(
+            "persistent",
+            Some("persistent"),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn different_default_domain_does_not_reuse_gui() {
+        assert!(!publish_is_allowed(
+            "local",
+            Some("persistent"),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn overridden_config_does_not_reuse_gui() {
+        assert!(!publish_is_allowed(
+            "persistent",
+            Some("persistent"),
+            false,
+            true
+        ));
     }
 }
 

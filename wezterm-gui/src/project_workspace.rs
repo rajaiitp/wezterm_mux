@@ -16,9 +16,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wezterm_project_workspace::{
-    default_managed_worktree_root, default_registry_path, plan_workspace, DomainKey, GitRepository,
-    LayoutProfile, Lifecycle, PaneRole, ProjectCatalog, Registry, RegistryWorkspace, WorkspaceId,
-    WorkspaceRequest, WorktreeSelection,
+    default_managed_worktree_root, default_registry_path, plan_workspace, GitRepository,
+    LayoutProfile, Lifecycle, PaneRole, ProjectCatalog, Registry, RegistryWorkspace,
+    WorkspaceDescriptor, WorkspaceId, WorkspaceRequest, WorktreeSelection,
 };
 use wezterm_term::TerminalSize;
 
@@ -141,16 +141,6 @@ pub(crate) fn select_worktree(
         return;
     }
     let worktree_path = PathBuf::from(worktree_id);
-    let existing_id = WorkspaceId::for_worktree(&DomainKey::local(), &worktree_path);
-    if Mux::get().workspace_exists(&existing_id.0) {
-        let workspace = existing_id.0;
-        promise::spawn::spawn_into_main_thread(async move {
-            crate::frontend::front_end().switch_workspace(&workspace, false);
-            anyhow::Result::<()>::Ok(())
-        })
-        .detach();
-        return;
-    }
     let request = WorkspaceRequest {
         project_path: worktree_path.clone(),
         selection: WorktreeSelection::Existing(worktree_path),
@@ -162,6 +152,43 @@ pub(crate) fn select_worktree(
         log::warn!("selected path is no longer a valid Git worktree");
         return;
     };
+    // Project workspace labels are their mux names too. Keep the friendly
+    // `project : branch` form, but add a stable short ID only when another
+    // live workspace already owns that label.
+    let mux = Mux::get();
+    let workspace = workspace_name_for_descriptor(&plan.descriptor, &mux);
+    if mux.workspace_exists(&workspace) {
+        promise::spawn::spawn_into_main_thread(async move {
+            crate::frontend::front_end().switch_workspace(&workspace, false);
+            anyhow::Result::<()>::Ok(())
+        })
+        .detach();
+        return;
+    }
+    // Migrate workspaces created before labels became mux names. If the rename
+    // fails, keep the legacy workspace usable instead of switching to a name
+    // that does not exist.
+    let legacy_workspace = plan.descriptor.id.0.clone();
+    if mux.workspace_exists(&legacy_workspace) {
+        if let Err(error) = mux.rename_workspace(&legacy_workspace, &workspace) {
+            log::warn!(
+                "unable to rename legacy workspace {legacy_workspace:?} to {workspace:?}: {error:#}"
+            );
+            promise::spawn::spawn_into_main_thread(async move {
+                crate::frontend::front_end().switch_workspace(&legacy_workspace, false);
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
+            return;
+        }
+        update_registry_workspace_label(&plan.descriptor.id, &workspace);
+        promise::spawn::spawn_into_main_thread(async move {
+            crate::frontend::front_end().switch_workspace(&workspace, false);
+            anyhow::Result::<()>::Ok(())
+        })
+        .detach();
+        return;
+    }
     promise::spawn::spawn(async move {
         if let Err(error) = launch_workspace(plan).await {
             log::error!("unable to launch project workspace: {error:#}");
@@ -300,7 +327,24 @@ async fn launch_workspace(plan: wezterm_project_workspace::WorkspacePlan) -> any
         let repository = GitRepository::discover(&descriptor.project_root)?;
         mutation.apply(&repository)?;
     }
-    let workspace = descriptor.id.0.clone();
+    // Keep the mux workspace name identical to the project/worktree label
+    // shown at the top-left of the tab bar (for example, `mind_me : main`).
+    // `descriptor.id` remains the stable opaque registry/environment ID.
+    // Resolve the name as late as possible so a second project with the same
+    // basename and branch gets a deterministic collision suffix rather than
+    // sharing the first project's panes.
+    let mux = Mux::get();
+    let workspace = workspace_name_for_descriptor(&descriptor, &mux);
+    if mux.workspace_exists(&workspace) {
+        // Selecting an already-launched worktree should focus it, not spawn a
+        // second editor/agent/review layout into the same workspace.
+        promise::spawn::spawn_into_main_thread(async move {
+            crate::frontend::front_end().switch_workspace(&workspace, false);
+            anyhow::Result::<()>::Ok(())
+        })
+        .detach();
+        return Ok(());
+    }
     let cwd = descriptor.worktree_path.clone();
     let cwd_string = cwd
         .to_str()
@@ -322,8 +366,10 @@ async fn launch_workspace(plan: wezterm_project_workspace::WorkspacePlan) -> any
     let editor = application_argv(&profile, PaneRole::Editor)?;
     let agent = application_argv(&profile, PaneRole::Agent)?;
     let review = application_argv(&profile, PaneRole::Review)?;
-    let mux = Mux::get();
-    let domain = SpawnTabDomain::DomainName("local".to_string());
+    // Project panes must live in the detachable persistent client domain.
+    // Using the GUI-local domain would make closing the GUI kill the whole
+    // project workspace instead of detaching from its persistent mux.
+    let domain = SpawnTabDomain::DomainName("persistent".to_string());
     let (_tab, editor_pane, _window_id) = mux
         .spawn_tab_or_window(
             None,
@@ -373,7 +419,7 @@ async fn launch_workspace(plan: wezterm_project_workspace::WorkspacePlan) -> any
         let mut registry = Registry::load(&path).unwrap_or_default();
         registry.remember_workspace(RegistryWorkspace {
             id: descriptor.id.clone(),
-            label: descriptor.label.clone(),
+            label: workspace.clone(),
             domain: descriptor.domain.clone(),
             project_id: descriptor.project_id.clone(),
             worktree_path: descriptor.worktree_path.clone(),
@@ -397,6 +443,73 @@ async fn launch_workspace(plan: wezterm_project_workspace::WorkspacePlan) -> any
     })
     .detach();
     Ok(())
+}
+
+fn workspace_name_for_descriptor(descriptor: &WorkspaceDescriptor, mux: &Mux) -> String {
+    let registry = default_registry_path()
+        .ok()
+        .and_then(|path| Registry::load(&path).ok());
+    let base = descriptor.label.trim().to_string();
+    let suffix = descriptor
+        .id
+        .0
+        .strip_prefix("dev:")
+        .unwrap_or(&descriptor.id.0);
+    let suffix: String = suffix.chars().take(8).collect();
+    let stable_collision_prefix = format!("{base} [{suffix}");
+
+    if let Some(registry) = registry.as_ref() {
+        // Reuse the actual live name for this stable worktree identity. This
+        // preserves collision suffixes across restarts.
+        if let Some(existing) = registry.workspaces.get(&descriptor.id) {
+            if mux.workspace_exists(&existing.label)
+                || existing.label == base
+                || existing.label.starts_with(&stable_collision_prefix)
+            {
+                return existing.label.clone();
+            }
+        }
+    }
+
+    let label_taken = |candidate: &str| {
+        mux.workspace_exists(candidate)
+            || registry.as_ref().is_some_and(|registry| {
+                registry
+                    .workspaces
+                    .values()
+                    .any(|workspace| workspace.id != descriptor.id && workspace.label == candidate)
+            })
+    };
+    if !label_taken(&base) {
+        return base;
+    }
+
+    let mut candidate = format!("{base} [{suffix}]");
+    let mut number = 2;
+    while label_taken(&candidate) {
+        candidate = format!("{base} [{suffix}-{number}]");
+        number += 1;
+    }
+    candidate
+}
+
+fn update_registry_workspace_label(id: &WorkspaceId, label: &str) {
+    let Ok(path) = default_registry_path() else {
+        return;
+    };
+    let Ok(mut registry) = Registry::load(&path) else {
+        return;
+    };
+    let Some(workspace) = registry.workspaces.get_mut(id) else {
+        return;
+    };
+    if workspace.label == label {
+        return;
+    }
+    workspace.label = label.to_string();
+    if let Err(error) = registry.save_atomic(&path) {
+        log::warn!("unable to update project workspace label: {error:#}");
+    }
 }
 
 fn application_argv(profile: &LayoutProfile, role: PaneRole) -> anyhow::Result<Vec<String>> {

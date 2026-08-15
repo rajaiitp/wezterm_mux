@@ -55,7 +55,7 @@ use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, HashSet, LinkedList};
 use std::ops::Add;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -423,6 +423,10 @@ pub struct TermWindow {
     /// Once the compositor has supplied a real geometry, that size is
     /// authoritative for tabs arriving from the persistent mux.
     has_received_resize: bool,
+    /// Tabs spawned at the mux default size need one real resize after the
+    /// compositor supplies geometry. Without this marker, layout-only resize
+    /// can leave their leaf PTYs at 80x24 until a workspace switch.
+    initial_tabs_needing_resize: HashSet<TabId>,
     /// Stop forwarding late compositor/teardown resizes after Win+Q begins
     /// closing this client window.
     closing: bool,
@@ -777,6 +781,20 @@ impl TermWindow {
         let render_state = None;
 
         let connection_name = Connection::get().unwrap().name();
+        // A project workspace can be fully provisioned before its GUI window
+        // is constructed. In that case TabAddedToWindow has already fired, so
+        // the tab cannot be marked by the notification handler. Seed the same
+        // first-geometry marker from the existing mux state.
+        let initial_tabs_needing_resize = mux
+            .get_window(mux_window_id)
+            .map(|window| {
+                window
+                    .iter()
+                    .filter(|tab| tab.get_size() == TerminalSize::default())
+                    .map(|tab| tab.tab_id())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let myself = Self {
             created: Instant::now(),
@@ -803,6 +821,7 @@ impl TermWindow {
             dimensions,
             window_state: WindowState::default(),
             has_received_resize: false,
+            initial_tabs_needing_resize,
             closing: false,
             resizes_pending: 0,
             is_repaint_pending: false,
@@ -1391,6 +1410,9 @@ impl TermWindow {
                     let mut size = self.terminal_size;
                     if let Some(tab) = mux.get_tab(tab_id) {
                         let tab_size = tab.get_size();
+                        if tab_size == TerminalSize::default() {
+                            self.initial_tabs_needing_resize.insert(tab_id);
+                        }
                         if self.has_received_resize || !self.window_state.can_resize() {
                             // Once the compositor has supplied a geometry, it
                             // is authoritative. A restored split tab can still
@@ -1399,11 +1421,26 @@ impl TermWindow {
                             // content or workspace bar.
                             if tab_size != self.terminal_size {
                                 log::debug!(
-                                    "syncing restored tab {} to compositor-owned size {:?}",
+                                    "syncing added tab {} to compositor-owned size {:?}",
                                     tab_id,
                                     self.terminal_size
                                 );
-                                tab.resize_layout(self.terminal_size);
+                                // Project workspaces are spawned at the mux
+                                // default (80×24). They need one real resize
+                                // on their first GUI attachment so their leaf
+                                // PTYs fill the split regions. Restored tabs
+                                // may carry an old full-screen geometry; keep
+                                // Keep the mux root authoritative before
+                                // padding reconciliation so future splits use
+                                // the full compositor-sized tab.
+                                if self.initial_tabs_needing_resize.remove(&tab_id)
+                                    || tab_size.rows != self.terminal_size.rows
+                                    || tab_size.cols != self.terminal_size.cols
+                                {
+                                    tab.resize(self.terminal_size);
+                                } else {
+                                    tab.resize_layout(self.terminal_size);
+                                }
                             }
                         } else {
                             // If we attached to a remote domain and loaded in
@@ -1420,7 +1457,14 @@ impl TermWindow {
                                 self.set_window_size(size, window)?;
                             } else if tab_size.dpi == 0 {
                                 log::debug!("fixup dpi in newly added tab");
-                                tab.resize_layout(self.terminal_size);
+                                if self.initial_tabs_needing_resize.remove(&tab_id)
+                                    || tab_size.rows != self.terminal_size.rows
+                                    || tab_size.cols != self.terminal_size.cols
+                                {
+                                    tab.resize(self.terminal_size);
+                                } else {
+                                    tab.resize_layout(self.terminal_size);
+                                }
                             }
                         }
                     }
@@ -1450,6 +1494,15 @@ impl TermWindow {
                     self.update_title_post_status();
                 }
                 MuxNotification::TabResized(_) => {
+                    // A newly-created split can retain the geometry from the
+                    // mux before the GUI applies the current window size.
+                    // Use the same synchronization path as tab activation so
+                    // its layout is correct without a manual tab round-trip.
+                    self.sync_active_tab_size();
+                    // A divider adjustment resizes the tab's leaf panes to
+                    // their full split rectangles. Restore the configured
+                    // content padding immediately after the layout sync.
+                    self.reconcile_pane_content_sizes();
                     // Also handled by wezterm-client
                     self.update_title_post_status();
                 }
@@ -1467,8 +1520,18 @@ impl TermWindow {
                     if let Some(tab_id) = overlay_tab {
                         self.cancel_overlay_for_tab(tab_id, Some(pane_id));
                     }
+                    // Closing a pane changes the parent split just like a
+                    // new split does. Recompute its complete layout and
+                    // redraw immediately rather than waiting for tab focus.
+                    self.sync_active_tab_size();
+                    self.reconcile_pane_content_sizes();
+                    self.update_title_post_status();
+                    window.invalidate();
                 }
                 MuxNotification::PaneAdded(_) => {
+                    // PaneAdded can precede the finalized split tree, while
+                    // TabResized follows it. Reconcile now for fast initial
+                    // paint; the full layout normalization runs on TabResized.
                     self.reconcile_pane_content_sizes();
                     self.update_title();
                 }
@@ -1513,9 +1576,15 @@ impl TermWindow {
                 let mux = Mux::get();
                 if let Some(window) = mux.get_window(self.mux_window_id) {
                     for tab in window.iter() {
-                        tab.resize_layout(self.terminal_size);
+                        if tab.get_size() == TerminalSize::default() {
+                            self.initial_tabs_needing_resize.insert(tab.tab_id());
+                            tab.resize(self.terminal_size);
+                        } else {
+                            tab.resize_layout(self.terminal_size);
+                        }
                     }
                 };
+                self.reconcile_pane_content_sizes();
                 self.update_title();
                 window.invalidate();
             }
@@ -3469,7 +3538,6 @@ impl TermWindow {
                     }
                     let spawn = spawn.as_ref().map(|s| s.clone()).unwrap_or_default();
                     let size = self.terminal_size;
-                    let content_padding = self.pane_content_padding_cells();
                     let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
                     let src_window_id = self.mux_window_id;
 
@@ -3480,7 +3548,6 @@ impl TermWindow {
                             size,
                             Some(src_window_id),
                             term_config,
-                            Some(content_padding),
                         )
                         .await
                         {
@@ -4027,6 +4094,17 @@ impl TermWindow {
                 tab_size,
                 self.terminal_size
             );
+        }
+        if tab_size.rows != self.terminal_size.rows
+            || tab_size.cols != self.terminal_size.cols
+        {
+            // A split can be created while the tab root still has bootstrap
+            // dimensions even though its existing leaf fills the GUI. Update
+            // the root with the compositor size before the next split.
+            tab.resize(self.terminal_size);
+        } else {
+            // resize_layout also normalizes nested split metadata when the
+            // outer tab size is unchanged.
             tab.resize_layout(self.terminal_size);
         }
     }

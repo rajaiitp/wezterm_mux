@@ -124,6 +124,8 @@ impl WorkspaceManager {
         }
         self.write_order();
         self.write_tabs();
+        self.rename_registry_workspace(old_name, new_name);
+        self.rename_last_location(old_name, new_name);
     }
 
     pub fn note_switch(&mut self, old_name: &str, new_name: &str) {
@@ -244,12 +246,20 @@ impl WorkspaceManager {
     }
 
     fn display_name(&mut self, active: &str) -> String {
-        let label = self
-            .workspace_registry()
-            .and_then(|registry| registry.workspaces.get(&WorkspaceId(active.to_string())))
-            .map(|workspace| workspace.label.trim())
-            .filter(|label| !label.is_empty());
+        let label = self.workspace_registry().and_then(|registry| {
+            registry
+                .workspaces
+                .get(&WorkspaceId(active.to_string()))
+                .or_else(|| {
+                    registry
+                        .workspaces
+                        .values()
+                        .find(|workspace| workspace.label.trim() == active)
+                })
+        });
         label
+            .map(|workspace| workspace.label.trim())
+            .filter(|label| !label.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| active.to_string())
     }
@@ -339,6 +349,44 @@ impl WorkspaceManager {
                 "previous_workspace".to_string(),
                 Value::from(previous.clone()),
             );
+        }
+        write_json(&self.last_location_path, &Value::Object(file));
+    }
+
+    fn rename_registry_workspace(&mut self, old_name: &str, new_name: &str) {
+        let Ok(path) = default_registry_path() else {
+            return;
+        };
+        let Ok(mut registry) = Registry::load(&path) else {
+            return;
+        };
+        let mut changed = false;
+        for (id, workspace) in &mut registry.workspaces {
+            if id.0 == old_name || workspace.label.trim() == old_name {
+                workspace.label = new_name.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(error) = registry.save_atomic(&path) {
+                log::warn!("unable to persist renamed workspace label: {error:#}");
+            }
+            self.registry_cache = None;
+        }
+    }
+
+    fn rename_last_location(&self, old_name: &str, new_name: &str) {
+        let Some(mut file) = fs::read_to_string(&self.last_location_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+            .and_then(|value| value.as_object().cloned())
+        else {
+            return;
+        };
+        for key in ["workspace", "previous_workspace"] {
+            if file.get(key).and_then(Value::as_str) == Some(old_name) {
+                file.insert(key.to_string(), Value::from(new_name.to_string()));
+            }
         }
         write_json(&self.last_location_path, &Value::Object(file));
     }

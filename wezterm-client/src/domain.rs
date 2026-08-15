@@ -849,6 +849,24 @@ impl ClientDomain {
     }
 }
 
+fn workspace_for_spawn_window(
+    window_workspace: Option<String>,
+    active_workspace: String,
+) -> String {
+    window_workspace
+        .filter(|workspace| !workspace.is_empty())
+        .unwrap_or(active_workspace)
+}
+
+fn should_create_workspace_for_spawn(
+    has_remote_window: bool,
+    workspace: &str,
+    active_workspace: &str,
+    active_workspace_is_creating: bool,
+) -> bool {
+    !has_remote_window && (workspace != active_workspace || active_workspace_is_creating)
+}
+
 #[async_trait(?Send)]
 impl Domain for ClientDomain {
     fn domain_id(&self) -> DomainId {
@@ -938,16 +956,35 @@ impl Domain for ClientDomain {
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
         let mux = Mux::get();
-        let workspace = mux.active_workspace();
-        let create_workspace = mux
-            .active_identity()
-            .is_some_and(|ident| mux.workspace_is_being_created_for_client(&ident));
+        // `spawn_tab_or_window` creates the local placeholder window with the
+        // requested workspace before calling into this domain. Use that
+        // window's workspace rather than the GUI client's currently active
+        // workspace; otherwise project launches from `config` ask the remote
+        // mux to spawn into `config` even though the placeholder is named
+        // `mind_me : main`.
+        let workspace = workspace_for_spawn_window(
+            mux.get_window(window)
+                .map(|window| window.get_workspace().to_string()),
+            mux.active_workspace(),
+        );
+        let remote_window_id = inner.local_to_remote_window(window);
+        let active_workspace = mux.active_workspace();
+        let active_workspace_is_creating = mux.active_identity().is_some_and(|ident| {
+            mux.active_workspace_for_client(&ident) == active_workspace
+                && mux.workspace_is_being_created_for_client(&ident)
+        });
+        let create_workspace = should_create_workspace_for_spawn(
+            remote_window_id.is_some(),
+            &workspace,
+            &active_workspace,
+            active_workspace_is_creating,
+        );
 
         let result = match inner
             .client
             .spawn_v2(SpawnV2 {
                 domain: SpawnTabDomain::DefaultDomain,
-                window_id: inner.local_to_remote_window(window),
+                window_id: remote_window_id,
                 create_workspace,
                 size,
                 command,
@@ -1147,5 +1184,46 @@ impl Domain for ClientDomain {
         } else {
             DomainState::Detached
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_create_workspace_for_spawn, workspace_for_spawn_window};
+
+    #[test]
+    fn spawn_uses_placeholder_window_workspace() {
+        assert_eq!(
+            workspace_for_spawn_window(Some("mind_me : feature".to_string()), "config".to_string(),),
+            "mind_me : feature"
+        );
+    }
+
+    #[test]
+    fn spawn_falls_back_to_active_workspace_without_placeholder() {
+        assert_eq!(
+            workspace_for_spawn_window(None, "config".to_string()),
+            "config"
+        );
+    }
+
+    #[test]
+    fn new_target_without_remote_window_requests_workspace_creation() {
+        assert!(should_create_workspace_for_spawn(
+            false,
+            "mind_me : feature",
+            "config",
+            false,
+        ));
+    }
+
+    #[test]
+    fn existing_remote_window_does_not_request_workspace_creation() {
+        assert!(!should_create_workspace_for_spawn(
+            true,
+            "mind_me : feature",
+            "config",
+            false,
+        ));
     }
 }

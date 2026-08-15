@@ -392,13 +392,17 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
                         }
                     }
                     SplitDirection::Horizontal => {
-                        // x_adjust is negative
+                        // x_adjust is negative. A stale nested layout can
+                        // already have both children at one cell; stop rather
+                        // than spinning forever when neither can shrink.
+                        let mut changed = false;
                         if data.first.cols > 1 {
                             adjust_x_size(&mut *left, -1, cell_dimensions);
                             data.first.cols -= 1;
                             data.first.pixel_width =
                                 data.first.cols.saturating_mul(cell_dimensions.pixel_width);
                             x_adjust += 1;
+                            changed = true;
                         }
                         if x_adjust < 0 && data.second.cols > 1 {
                             adjust_x_size(&mut *right, -1, cell_dimensions);
@@ -406,6 +410,10 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
                             data.second.pixel_width =
                                 data.second.cols.saturating_mul(cell_dimensions.pixel_width);
                             x_adjust += 1;
+                            changed = true;
+                        }
+                        if !changed {
+                            return;
                         }
                     }
                 }
@@ -463,13 +471,17 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                         }
                     }
                     SplitDirection::Vertical => {
-                        // y_adjust is negative
+                        // y_adjust is negative. See the matching horizontal
+                        // case above: stale one-cell children must not trap
+                        // the resize loop when no further shrink is possible.
+                        let mut changed = false;
                         if data.first.rows > 1 {
                             adjust_y_size(&mut *left, -1, cell_dimensions);
                             data.first.rows -= 1;
                             data.first.pixel_height =
                                 data.first.rows.saturating_mul(cell_dimensions.pixel_height);
                             y_adjust += 1;
+                            changed = true;
                         }
                         if y_adjust < 0 && data.second.rows > 1 {
                             adjust_y_size(&mut *right, -1, cell_dimensions);
@@ -479,6 +491,10 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                                 .rows
                                 .saturating_mul(cell_dimensions.pixel_height);
                             y_adjust += 1;
+                            changed = true;
+                        }
+                        if !changed {
+                            return;
                         }
                     }
                 }
@@ -503,6 +519,66 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
             pane.resize(*size).ok();
         }
     }
+}
+
+/// Make every split rectangle exactly cover its parent, including its divider.
+/// This fixes stale nested split metadata without resizing leaf PTYs: panes may
+/// deliberately be smaller than their split rectangles due to content padding.
+fn normalize_layout_tree(tree: &mut Tree, size: TerminalSize) -> bool {
+    let Tree::Node {
+        left,
+        right,
+        data: Some(data),
+    } = tree
+    else {
+        return false;
+    };
+
+    let (left_min_x, left_min_y) = compute_min_size(left);
+    let (right_min_x, right_min_y) = compute_min_size(right);
+    let cell_dimensions = cell_dimensions(&size);
+    let previous_first = data.first;
+    let previous_second = data.second;
+
+    match data.direction {
+        SplitDirection::Horizontal => {
+            let available = size.cols.saturating_sub(1);
+            let max_first = available.saturating_sub(right_min_x);
+            let first_cols = if left_min_x <= max_first {
+                data.first.cols.clamp(left_min_x, max_first)
+            } else {
+                left_min_x.min(available)
+            };
+            data.first.cols = first_cols;
+            data.second.cols = available.saturating_sub(first_cols);
+            data.first.rows = size.rows;
+            data.second.rows = size.rows;
+        }
+        SplitDirection::Vertical => {
+            let available = size.rows.saturating_sub(1);
+            let max_first = available.saturating_sub(right_min_y);
+            let first_rows = if left_min_y <= max_first {
+                data.first.rows.clamp(left_min_y, max_first)
+            } else {
+                left_min_y.min(available)
+            };
+            data.first.rows = first_rows;
+            data.second.rows = available.saturating_sub(first_rows);
+            data.first.cols = size.cols;
+            data.second.cols = size.cols;
+        }
+    }
+
+    data.first.pixel_width = data.first.cols * cell_dimensions.pixel_width;
+    data.first.pixel_height = data.first.rows * cell_dimensions.pixel_height;
+    data.second.pixel_width = data.second.cols * cell_dimensions.pixel_width;
+    data.second.pixel_height = data.second.rows * cell_dimensions.pixel_height;
+
+    let first = data.first;
+    let second = data.second;
+    let left_changed = normalize_layout_tree(left, first);
+    let right_changed = normalize_layout_tree(right, second);
+    previous_first != first || previous_second != second || left_changed || right_changed
 }
 
 fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
@@ -1160,16 +1236,18 @@ impl TabInner {
     }
 
     fn resize_layout(&mut self, size: TerminalSize) {
-        if size.rows == 0 || size.cols == 0 || self.size == size {
+        if size.rows == 0 || size.cols == 0 {
             return;
         }
 
+        let previous_size = self.size;
+        let layout_changed;
         if self.zoomed.is_some() {
             self.size = size;
+            layout_changed = previous_size != size;
         } else {
             let dims = cell_dimensions(&size);
             let (min_x, min_y) = compute_min_size(self.pane.as_mut().unwrap());
-            let current_size = self.size;
             let cols = size.cols.max(min_x);
             let rows = size.rows.max(min_y);
             let size = TerminalSize {
@@ -1182,18 +1260,25 @@ impl TabInner {
 
             adjust_x_size(
                 self.pane.as_mut().unwrap(),
-                cols as isize - current_size.cols as isize,
+                cols as isize - previous_size.cols as isize,
                 &dims,
             );
             adjust_y_size(
                 self.pane.as_mut().unwrap(),
-                rows as isize - current_size.rows as isize,
+                rows as isize - previous_size.rows as isize,
                 &dims,
             );
             self.size = size;
+            // A pane resize or close can leave a nested node one cell larger
+            // than its parent. Repair that stale geometry even when the tab
+            // itself already matches the GUI dimensions.
+            layout_changed = previous_size != size
+                || normalize_layout_tree(self.pane.as_mut().unwrap(), size);
         }
 
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        if layout_changed {
+            Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        }
     }
 
     fn resize(&mut self, size: TerminalSize) {
@@ -1804,13 +1889,18 @@ impl TabInner {
                         };
 
                         if let Some(unsplit) = cursor.leaf_mut() {
-                            unsplit.resize(size).ok();
+                            // A GUI mirror must not rebuild the persistent
+                            // mux tree from this transient full-size PTY.
+                            // Local panes use the default implementation,
+                            // so the authoritative mux still resizes normally.
+                            unsplit.resize_preserving_layout(size).ok();
                         } else {
                             self.apply_pane_size(size, &mut cursor);
                         }
                     } else if !dead_panes.is_empty() {
-                        // Apply our revised size to the tty
-                        pane.resize(pane_size).ok();
+                        // Apply the revised size without letting a GUI mirror
+                        // reinterpret padded leaf dimensions as split geometry.
+                        pane.resize_preserving_layout(pane_size).ok();
                     }
 
                     pane_index += 1;
@@ -2195,8 +2285,13 @@ impl TabInner {
                 (pane, existing_pane)
             };
 
-            pane1.resize(split_info.first)?;
-            pane2.resize(split_info.second.clone())?;
+            // The local GUI mirrors the remote split before its full pane
+            // list arrives. Preserve the authoritative split tree while its
+            // client panes briefly receive these full split dimensions;
+            // otherwise their content-padding resize can move a bottom or
+            // right edge on every subsequent split.
+            pane1.resize_preserving_layout(split_info.first)?;
+            pane2.resize_preserving_layout(split_info.second.clone())?;
 
             *cursor.leaf_mut().unwrap() = pane1;
 
@@ -2364,6 +2459,7 @@ mod test {
     use parking_lot::{MappedMutexGuard, Mutex};
     use rangeset::RangeSet;
     use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use termwiz::surface::SequenceNo;
     use url::Url;
     use wezterm_term::color::ColorPalette;
@@ -2372,13 +2468,21 @@ mod test {
     struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,
+        normal_resizes: AtomicUsize,
+        layout_resizes: AtomicUsize,
     }
 
     impl FakePane {
         fn new(id: PaneId, size: TerminalSize) -> Arc<dyn Pane> {
+            Self::tracked(id, size)
+        }
+
+        fn tracked(id: PaneId, size: TerminalSize) -> Arc<Self> {
             Arc::new(Self {
                 id,
                 size: Mutex::new(size),
+                normal_resizes: AtomicUsize::new(0),
+                layout_resizes: AtomicUsize::new(0),
             })
         }
     }
@@ -2445,6 +2549,13 @@ mod test {
             unimplemented!()
         }
         fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+            self.normal_resizes.fetch_add(1, Ordering::Relaxed);
+            *self.size.lock() = size;
+            Ok(())
+        }
+
+        fn resize_preserving_layout(&self, size: TerminalSize) -> anyhow::Result<()> {
+            self.layout_resizes.fetch_add(1, Ordering::Relaxed);
             *self.size.lock() = size;
             Ok(())
         }
@@ -2735,6 +2846,327 @@ mod test {
         assert_eq!(1, panes[1].width);
         assert_eq!(76, panes[2].width);
         assert!(panes.iter().all(|pane| pane.width > 0 && pane.height > 0));
+    }
+
+    #[test]
+    fn layout_resize_keeps_all_split_rectangles_inside_the_tab() {
+        let initial = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let resized = TerminalSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 1000,
+            dpi: 96,
+        };
+        let tab = Tab::new(&initial);
+        tab.assign_pane(&FakePane::new(1, initial));
+
+        let horizontal = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new(2, horizontal.second),
+        )
+        .unwrap();
+
+        let vertical = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Vertical,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Vertical,
+                ..Default::default()
+            },
+            FakePane::new(3, vertical.second),
+        )
+        .unwrap();
+
+        tab.resize_layout(resized);
+        let panes = tab.iter_panes();
+        assert_eq!(tab.get_size(), resized);
+        assert!(panes.iter().all(|pane| {
+            pane.width > 0
+                && pane.height > 0
+                && pane.left + pane.width <= resized.cols
+                && pane.top + pane.height <= resized.rows
+        }));
+        for (index, left) in panes.iter().enumerate() {
+            for right in panes.iter().skip(index + 1) {
+                let overlaps = left.left < right.left + right.width
+                    && right.left < left.left + left.width
+                    && left.top < right.top + right.height
+                    && right.top < left.top + left.height;
+                assert!(!overlaps, "split panes overlap: {:?} and {:?}", left, right);
+            }
+        }
+    }
+
+    #[test]
+    fn layout_resize_repairs_stale_nested_edges_at_the_same_tab_size() {
+        let initial = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let repaired = TerminalSize {
+            rows: 23,
+            cols: 79,
+            pixel_width: 790,
+            pixel_height: 575,
+            dpi: 96,
+        };
+        let tab = Tab::new(&initial);
+        tab.assign_pane(&FakePane::new(1, initial));
+
+        let horizontal = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new(2, horizontal.second),
+        )
+        .unwrap();
+
+        let vertical = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Vertical,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Vertical,
+                ..Default::default()
+            },
+            FakePane::new(3, vertical.second),
+        )
+        .unwrap();
+
+        // Model the bad mux state: the tab has the current GUI size, while a
+        // nested split still describes the preceding, one-cell-larger layout.
+        tab.inner.lock().size = repaired;
+        tab.resize_layout(repaired);
+
+        let panes = tab.iter_panes();
+        assert_eq!(tab.get_size(), repaired);
+        assert!(panes.iter().all(|pane| {
+            pane.width > 0
+                && pane.height > 0
+                && pane.left + pane.width <= repaired.cols
+                && pane.top + pane.height <= repaired.rows
+        }));
+    }
+
+    fn assert_render_layout_is_a_complete_tiling(tab: &Tab) {
+        let size = tab.get_size();
+        let panes = tab.iter_panes();
+        let splits = tab.iter_splits();
+        assert!(!panes.is_empty());
+
+        let mut coverage = vec![0u8; size.cols * size.rows];
+        let mut mark = |left: usize, top: usize, width: usize, height: usize, label: &str| {
+            assert!(width > 0 && height > 0, "{} has an empty rectangle", label);
+            assert!(
+                left + width <= size.cols && top + height <= size.rows,
+                "{label} is outside tab {:?}: left={left}, top={top}, width={width}, height={height}",
+                size
+            );
+            for y in top..top + height {
+                for x in left..left + width {
+                    let cell = &mut coverage[y * size.cols + x];
+                    *cell += 1;
+                    assert_eq!(*cell, 1, "{label} overlaps an existing rendered rectangle");
+                }
+            }
+        };
+
+        for pane in panes {
+            mark(pane.left, pane.top, pane.width, pane.height, "pane");
+        }
+        for split in splits {
+            match split.direction {
+                SplitDirection::Horizontal => mark(split.left, split.top, 1, split.size, "split"),
+                SplitDirection::Vertical => mark(split.left, split.top, split.size, 1, "split"),
+            }
+        }
+
+        assert!(
+            coverage.iter().all(|cell| *cell == 1),
+            "pane and divider rectangles must cover every rendered cell exactly once"
+        );
+    }
+
+    #[test]
+    fn client_mirror_split_and_close_preserve_the_authoritative_layout() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        let first = FakePane::tracked(1, size);
+        let first_pane: Arc<dyn Pane> = first.clone();
+        tab.assign_pane(&first_pane);
+
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Vertical,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let second = FakePane::tracked(2, split.second);
+        let second_pane: Arc<dyn Pane> = second.clone();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Vertical,
+                ..Default::default()
+            },
+            second_pane,
+        )
+        .unwrap();
+
+        assert_eq!(first.normal_resizes.load(Ordering::Relaxed), 0);
+        assert_eq!(second.normal_resizes.load(Ordering::Relaxed), 0);
+        assert_eq!(first.layout_resizes.load(Ordering::Relaxed), 1);
+        assert_eq!(second.layout_resizes.load(Ordering::Relaxed), 1);
+
+        tab.remove_pane(second.pane_id()).unwrap();
+        assert_eq!(first.normal_resizes.load(Ordering::Relaxed), 0);
+        assert!(first.layout_resizes.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> usize {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (self.0 >> 32) as usize
+        }
+    }
+
+    #[test]
+    fn random_split_close_resize_sequences_tile_the_render_surface() {
+        const INITIAL: TerminalSize = TerminalSize {
+            rows: 60,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 1500,
+            dpi: 96,
+        };
+
+        for seed in 0..12 {
+            let tab = Tab::new(&INITIAL);
+            tab.assign_pane(&FakePane::new(1, INITIAL));
+            let mut rng = TestRng(seed + 1);
+            let mut next_pane_id = 2;
+
+            for _ in 0..128 {
+                match rng.next() % 10 {
+                    // Split arbitrary existing panes in both directions with
+                    // varied placement and proportions.
+                    0..=4 => {
+                        let panes = tab.iter_panes();
+                        let pane_index = rng.next() % panes.len();
+                        let request = SplitRequest {
+                            direction: if rng.next() & 1 == 0 {
+                                SplitDirection::Horizontal
+                            } else {
+                                SplitDirection::Vertical
+                            },
+                            target_is_second: rng.next() & 1 == 0,
+                            size: SplitSize::Percent(20 + (rng.next() % 61) as u8),
+                            top_level: false,
+                        };
+                        if let Some(split) = tab.compute_split_size(pane_index, request) {
+                            if tab
+                                .split_and_insert(
+                                    pane_index,
+                                    request,
+                                    FakePane::new(next_pane_id, split.second),
+                                )
+                                .is_ok()
+                            {
+                                next_pane_id += 1;
+                            }
+                        }
+                    }
+                    // Close arbitrary panes, retaining one leaf so each
+                    // subsequent operation still has a surface to render.
+                    5..=8 => {
+                        let panes = tab.iter_panes();
+                        if panes.len() > 1 {
+                            let pane = &panes[rng.next() % panes.len()];
+                            assert!(tab.remove_pane(pane.pane.pane_id()).is_some());
+                        }
+                    }
+                    // Recompute at a new GUI size, including odd dimensions
+                    // that expose off-by-one errors on the right and bottom.
+                    _ => {
+                        let cols = 40 + rng.next() % 121;
+                        let rows = 20 + rng.next() % 81;
+                        tab.resize_layout(TerminalSize {
+                            rows,
+                            cols,
+                            pixel_width: cols * 10,
+                            pixel_height: rows * 25,
+                            dpi: 96,
+                        });
+                    }
+                }
+
+                // This is the same-size recomputation used after pane
+                // topology notifications; it must also be a no-gap tiling.
+                tab.resize_layout(tab.get_size());
+                assert_render_layout_is_a_complete_tiling(&tab);
+            }
+        }
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {
