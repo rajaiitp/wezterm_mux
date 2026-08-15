@@ -169,11 +169,6 @@ impl crate::TermWindow {
             }
         }
 
-        // Apply content padding to the PTY dimensions before rendering. This
-        // lets terminal applications lay themselves out for the exposed area
-        // instead of rendering a full pane and being clipped afterward.
-        self.reconcile_pane_content_sizes();
-
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
 
@@ -346,13 +341,15 @@ impl crate::TermWindow {
         }
 
         // Draw inactive borders first so the active pane's border wins at
-        // shared edges.
+        // shared edges. A single pane always owns the full terminal surface,
+        // even while its cached PTY dimensions are catching up.
+        let single_pane = panes.len() == 1;
         for pos in panes.iter().filter(|pos| !pos.is_active) {
-            self.paint_pane_border(pos, &mut layers)
+            self.paint_pane_border(pos, &mut layers, single_pane)
                 .context("paint inactive pane border")?;
         }
         for pos in panes.iter().filter(|pos| pos.is_active) {
-            self.paint_pane_border(pos, &mut layers)
+            self.paint_pane_border(pos, &mut layers, single_pane)
                 .context("paint active pane border")?;
         }
 

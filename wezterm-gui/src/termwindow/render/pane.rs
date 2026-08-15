@@ -48,6 +48,7 @@ impl crate::TermWindow {
         &mut self,
         pos: &PositionedPane,
         layers: &mut TripleLayerQuadAllocator,
+        single_pane: bool,
     ) -> anyhow::Result<()> {
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
@@ -77,8 +78,14 @@ impl crate::TermWindow {
             + os_border.top.get() as f32
             + pos.top as f32 * cell_height
             - if pos.top == 0 { 0.0 } else { cell_height / 2.0 };
-        let has_right_split = pos.left + pos.width < self.terminal_size.cols as usize;
-        let has_bottom_split = pos.top + pos.height < self.terminal_size.rows as usize;
+        // A single-pane tab is the complete terminal surface even if its
+        // cached pane dimensions briefly lag the window's cell grid. Do not
+        // interpret that transient mismatch as a split; doing so makes the
+        // border jump by the split hit-target width after the first resize.
+        let has_right_split =
+            !single_pane && pos.left + pos.width < self.terminal_size.cols as usize;
+        let has_bottom_split =
+            !single_pane && pos.top + pos.height < self.terminal_size.rows as usize;
         let outer_width = if !has_right_split {
             (self.dimensions.pixel_width as f32
                 - outer_x
@@ -109,16 +116,18 @@ impl crate::TermWindow {
             pane_padding_left
         };
         let inset_top = if pos.top == 0 { 0.0 } else { pane_padding_top };
-        let inset_right = if pos.left + pos.width >= self.terminal_size.cols as usize {
+        let inset_right = if single_pane || pos.left + pos.width >= self.terminal_size.cols as usize
+        {
             0.0
         } else {
             pane_padding_right
         };
-        let inset_bottom = if pos.top + pos.height >= self.terminal_size.rows as usize {
-            0.0
-        } else {
-            pane_padding_bottom
-        };
+        let inset_bottom =
+            if single_pane || pos.top + pos.height >= self.terminal_size.rows as usize {
+                0.0
+            } else {
+                pane_padding_bottom
+            };
         let x = outer_x + inset_left;
         let y = outer_y + inset_top;
         let width = (outer_width - inset_left - inset_right).max(0.0);

@@ -408,6 +408,10 @@ You may add padding around the edges of the terminal area.
 
 [See the window_padding docs for more info](lua/config/window_padding.md)
 
+Pane borders can be spaced apart with [pane_padding](lua/config/pane_padding.md),
+and terminal content can be inset from those borders with
+[pane_content_padding](lua/config/pane_content_padding.md).
+
 ## Styling Inactive Panes
 
 {{since('20201031-154415-9614e117')}}

@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use termwiz::cell::{AttributeChange, Intensity};
 use termwiz_funcs::{format_as_escapes, FormatColor, FormatItem};
 use wezterm_project_workspace::{default_registry_path, Registry, WorkspaceId};
@@ -47,6 +47,7 @@ pub struct WorkspaceManager {
     // order intact during that short bootstrap window instead of pruning
     // names that have not arrived yet.
     preserve_saved_order_until: Instant,
+    registry_cache: Option<(PathBuf, Option<SystemTime>, Registry)>,
 }
 
 pub fn ordered_workspace_names() -> Vec<String> {
@@ -78,6 +79,7 @@ impl WorkspaceManager {
             tabs_path,
             previous: load_previous_workspace(&last_location_path),
             preserve_saved_order_until: Instant::now() + Duration::from_secs(5),
+            registry_cache: None,
         }
     }
 
@@ -241,31 +243,40 @@ impl WorkspaceManager {
         (status, names)
     }
 
-    fn display_name(&self, active: &str) -> String {
-        let Ok(path) = default_registry_path() else {
-            return active.to_string();
-        };
-        let Ok(registry) = Registry::load(&path) else {
-            return active.to_string();
-        };
-        registry
-            .workspaces
-            .get(&WorkspaceId(active.to_string()))
+    fn display_name(&mut self, active: &str) -> String {
+        let label = self
+            .workspace_registry()
+            .and_then(|registry| registry.workspaces.get(&WorkspaceId(active.to_string())))
             .map(|workspace| workspace.label.trim())
-            .filter(|label| !label.is_empty())
+            .filter(|label| !label.is_empty());
+        label
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| active.to_string())
     }
 
-    pub fn picker_names(&mut self, active: &str) -> Vec<String> {
-        let mut names = self.display_names();
-        if !names.iter().any(|name| name == active)
-            && active != DEFAULT_WORKSPACE
-            && workspace_is_live(active)
-        {
-            names.push(active.to_string());
+    fn workspace_registry(&mut self) -> Option<&Registry> {
+        let path = default_registry_path().ok()?;
+        let modified = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let cache_is_current = self
+            .registry_cache
+            .as_ref()
+            .map(|(cached_path, cached_modified, _)| {
+                cached_path == &path && *cached_modified == modified
+            })
+            .unwrap_or(false);
+        if !cache_is_current {
+            let registry = Registry::load(&path).unwrap_or_default();
+            self.registry_cache = Some((path, modified, registry));
         }
-        names
+        self.registry_cache
+            .as_ref()
+            .map(|(_, _, registry)| registry)
+    }
+
+    pub fn picker_names(&mut self, active: &str) -> Vec<String> {
+        picker_names_from(self.display_names(), active, workspace_is_live(active))
     }
 
     fn sync_order(&mut self) {
@@ -333,6 +344,16 @@ impl WorkspaceManager {
     }
 }
 
+fn picker_names_from(mut names: Vec<String>, active: &str, active_is_live: bool) -> Vec<String> {
+    if !names.iter().any(|name| name == DEFAULT_WORKSPACE) {
+        names.insert(0, DEFAULT_WORKSPACE.to_string());
+    }
+    if !names.iter().any(|name| name == active) && active != DEFAULT_WORKSPACE && active_is_live {
+        names.push(active.to_string());
+    }
+    names
+}
+
 fn workspace_is_live(name: &str) -> bool {
     Mux::get()
         .iter_workspaces()
@@ -391,5 +412,26 @@ fn write_json<T: Serialize>(path: &PathBuf, value: &T) {
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     if fs::write(&temporary, encoded).is_ok() {
         let _ = fs::rename(temporary, path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{picker_names_from, DEFAULT_WORKSPACE};
+
+    #[test]
+    fn picker_includes_default_workspace() {
+        assert_eq!(
+            picker_names_from(vec!["project".to_string()], DEFAULT_WORKSPACE, false),
+            vec!["default", "project"]
+        );
+    }
+
+    #[test]
+    fn picker_adds_an_unordered_live_workspace() {
+        assert_eq!(
+            picker_names_from(vec![DEFAULT_WORKSPACE.to_string()], "live", true),
+            vec!["default", "live"]
+        );
     }
 }

@@ -307,6 +307,10 @@ impl super::TermWindow {
                 tab.resize(size);
             }
         };
+        // Resize pane content before the next frame is painted. Doing this in
+        // paint_pass makes applications briefly render at the unpadded size,
+        // then visibly shrink once the first frame reconciles the PTY.
+        self.reconcile_pane_content_sizes();
         self.resize_overlays();
         self.invalidate_fancy_tab_bar();
         self.update_title();
@@ -351,13 +355,19 @@ impl super::TermWindow {
         }
     }
 
-    pub fn reconcile_pane_content_sizes(&mut self) {
+    pub fn pane_content_padding_cells(&self) -> (usize, usize) {
         let (padding_left, padding_top, padding_right, padding_bottom) =
             self.pane_content_padding_pixels();
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
-        let removed_cols = ((padding_left + padding_right) / cell_width).ceil() as usize;
-        let removed_rows = ((padding_top + padding_bottom) / cell_height).ceil() as usize;
+        (
+            ((padding_left + padding_right) / cell_width).ceil() as usize,
+            ((padding_top + padding_bottom) / cell_height).ceil() as usize,
+        )
+    }
+
+    pub fn reconcile_pane_content_sizes(&mut self) {
+        let (removed_cols, removed_rows) = self.pane_content_padding_cells();
 
         let mux = Mux::get();
         let Some(window) = mux.get_window(self.mux_window_id) else {

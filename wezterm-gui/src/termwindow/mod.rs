@@ -1424,6 +1424,10 @@ impl TermWindow {
                             }
                         }
                     }
+                    // Newly added panes can start producing output before the
+                    // next paint. Apply content padding now so applications do
+                    // not first render at the unpadded tab size.
+                    self.reconcile_pane_content_sizes();
                 }
                 MuxNotification::PaneOutput(pane_id) => {
                     self.mux_pane_output_event(pane_id);
@@ -1464,8 +1468,11 @@ impl TermWindow {
                         self.cancel_overlay_for_tab(tab_id, Some(pane_id));
                     }
                 }
-                MuxNotification::PaneAdded(_)
-                | MuxNotification::PaneExited(_, _)
+                MuxNotification::PaneAdded(_) => {
+                    self.reconcile_pane_content_sizes();
+                    self.update_title();
+                }
+                MuxNotification::PaneExited(_, _)
                 | MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
@@ -1736,11 +1743,18 @@ impl TermWindow {
         }
     }
 
-    fn set_native_workspace_click_targets(&mut self, workspaces: &[String], status_width: usize) {
+    fn set_native_workspace_click_targets(&mut self, workspaces: &[String], status: &str) {
         self.right_status_click_targets.clear();
         if workspaces.len() == 1 {
+            // The native status contains one spacer cell on either side of the
+            // workspace pill. Parse the escapes so the hitbox uses display
+            // cells rather than the byte length of the encoded status string.
+            let status_width =
+                crate::tabbar::parse_status_text(status, termwiz::cell::CellAttributes::default())
+                    .len();
+            let pill_width = status_width.saturating_sub(2);
             self.right_status_click_targets
-                .push((workspaces[0].clone(), 1, status_width));
+                .push((workspaces[0].clone(), 1, 1 + pill_width));
         } else {
             self.set_right_status_click_targets(workspaces);
         }
@@ -2224,7 +2238,7 @@ impl TermWindow {
             };
         self.set_native_workspace_click_targets(
             &native_workspace_targets,
-            native_workspace_status.len(),
+            &native_workspace_status,
         );
         log::trace!(
             "workspace status window={} active={:?} targets={} status_bytes={}",
@@ -2455,6 +2469,7 @@ impl TermWindow {
 
             drop(window);
             self.sync_active_tab_size();
+            self.reconcile_pane_content_sizes();
 
             if let Some(pane) = self.get_active_pane_or_overlay() {
                 pane.focus_changed(true);
@@ -3443,6 +3458,7 @@ impl TermWindow {
                     }
                     let spawn = spawn.as_ref().map(|s| s.clone()).unwrap_or_default();
                     let size = self.terminal_size;
+                    let content_padding = self.pane_content_padding_cells();
                     let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
                     let src_window_id = self.mux_window_id;
 
@@ -3453,6 +3469,7 @@ impl TermWindow {
                             size,
                             Some(src_window_id),
                             term_config,
+                            Some(content_padding),
                         )
                         .await
                         {

@@ -79,7 +79,6 @@ fn install_leader_defaults(keys: &mut KeyTables) {
     );
     add_leader_default(keys, KeyCode::Char('z'), TogglePaneZoomState);
     add_leader_default(keys, KeyCode::Char('\t'), SwitchWorkspaceRelative(-1));
-    add_leader_default(keys, KeyCode::Char('s'), ShowWorkspacePicker);
     add_leader_default(
         keys,
         KeyCode::Char('w'),
@@ -229,6 +228,13 @@ impl InputMap {
                     .entry((code, mods))
                     .or_insert(KeyTableEntry { action });
             }
+            // Ctrl+S opens the native workspace picker independently of the
+            // optional leader key. Explicit user bindings still win.
+            keys.default
+                .entry((KeyCode::Char('s'), Modifiers::CTRL))
+                .or_insert(KeyTableEntry {
+                    action: ShowWorkspacePicker,
+                });
             if leader.is_some() {
                 install_leader_defaults(&mut keys);
             }
@@ -924,6 +930,25 @@ fn lua_key(key: &KeyCode, mods: Modifiers, action: &KeyAssignment) -> String {
     let mods = format!("{mods:?}").replace(" ", "");
 
     format!("{{ key = {key}, mods = '{mods}', action = {action} }}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_picker_uses_ctrl_s_without_leader() {
+        let input_map = InputMap::default_input_map();
+        assert_eq!(
+            input_map
+                .lookup_key(&KeyCode::Char('s'), Modifiers::CTRL, None)
+                .map(|entry| entry.action),
+            Some(KeyAssignment::ShowWorkspacePicker)
+        );
+        assert!(input_map
+            .lookup_key(&KeyCode::Char('s'), Modifiers::LEADER, None)
+            .is_none());
+    }
 }
 
 fn show_key_table(table: &config::keyassignment::KeyTable) {

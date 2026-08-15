@@ -316,7 +316,14 @@ impl GuiFrontEnd {
                         config.initial_size(dpi as u32, crate::cell_pixel_dims(&config, dpi).ok());
                     let term_config = Arc::new(config::TermConfig::with_config(config));
 
-                    crate::spawn::spawn_command_impl(spawn, spawn_where, size, None, term_config)
+                    crate::spawn::spawn_command_impl(
+                        spawn,
+                        spawn_where,
+                        size,
+                        None,
+                        term_config,
+                        None,
+                    )
                 }
 
                 match action {
