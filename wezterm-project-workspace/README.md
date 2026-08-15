@@ -14,5 +14,6 @@ The crate provides:
 - a versioned, atomic, private workspace registry.
 
 It intentionally contains no GUI or mux code. `wezterm-gui` owns native modal
-interaction and launches the provisional `agentic` profile (`nvim`, `pi
---continue`, and `tuicr --working-tree`) in the selected worktree.
+interaction and launches the profile configured in `wezterm.lua`. The
+provided dotfile configuration opens `pi --continue` on the left and `nvim .`
+on the right; tuicr is available separately and is not opened automatically.

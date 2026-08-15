@@ -49,6 +49,30 @@ use wezterm_input_types::{
 use wezterm_term::TerminalSize;
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct ProjectWorkspaceApplication {
+    pub role: String,
+    pub launch: Vec<String>,
+    #[dynamic(default)]
+    pub resume: Option<Vec<String>>,
+    #[dynamic(default = "default_true")]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+pub struct ProjectWorkspaceLayoutNode {
+    #[dynamic(default)]
+    pub role: Option<String>,
+    #[dynamic(default)]
+    pub direction: Option<String>,
+    #[dynamic(default)]
+    pub ratio: Option<f32>,
+    #[dynamic(default)]
+    pub first: Option<Box<ProjectWorkspaceLayoutNode>>,
+    #[dynamic(default)]
+    pub second: Option<Box<ProjectWorkspaceLayoutNode>>,
+}
+
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct ProjectWorkspaceConfig {
     /// Enable the native project/worktree picker.
     #[dynamic(default = "default_true")]
@@ -73,6 +97,12 @@ pub struct ProjectWorkspaceConfig {
     /// Directory names excluded from project discovery.
     #[dynamic(default = "default_project_exclusions")]
     pub excluded_directories: Vec<String>,
+
+    /// Dotfile-defined pane topology and applications for new workspaces.
+    #[dynamic(default = "default_project_workspace_layout")]
+    pub layout: ProjectWorkspaceLayoutNode,
+    #[dynamic(default = "default_project_workspace_applications")]
+    pub applications: Vec<ProjectWorkspaceApplication>,
 }
 
 impl Default for ProjectWorkspaceConfig {
@@ -84,6 +114,8 @@ impl Default for ProjectWorkspaceConfig {
             use_zoxide: true,
             worktree_root: None,
             excluded_directories: default_project_exclusions(),
+            layout: default_project_workspace_layout(),
+            applications: default_project_workspace_applications(),
         }
     }
 }
@@ -97,6 +129,45 @@ fn default_project_exclusions() -> Vec<String> {
         .iter()
         .map(|name| (*name).to_string())
         .collect()
+}
+
+fn default_project_workspace_layout() -> ProjectWorkspaceLayoutNode {
+    ProjectWorkspaceLayoutNode {
+        role: None,
+        direction: Some("Horizontal".to_string()),
+        ratio: Some(0.5),
+        first: Some(Box::new(ProjectWorkspaceLayoutNode {
+            role: Some("agent".to_string()),
+            direction: None,
+            ratio: None,
+            first: None,
+            second: None,
+        })),
+        second: Some(Box::new(ProjectWorkspaceLayoutNode {
+            role: Some("editor".to_string()),
+            direction: None,
+            ratio: None,
+            first: None,
+            second: None,
+        })),
+    }
+}
+
+fn default_project_workspace_applications() -> Vec<ProjectWorkspaceApplication> {
+    vec![
+        ProjectWorkspaceApplication {
+            role: "agent".to_string(),
+            launch: vec!["pi".to_string(), "--continue".to_string()],
+            resume: Some(vec!["pi".to_string(), "--continue".to_string()]),
+            required: true,
+        },
+        ProjectWorkspaceApplication {
+            role: "editor".to_string(),
+            launch: vec!["nvim".to_string(), ".".to_string()],
+            resume: None,
+            required: true,
+        },
+    ]
 }
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]

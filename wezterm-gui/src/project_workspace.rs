@@ -7,7 +7,10 @@
 use config::keyassignment::{
     InputSelector, InputSelectorEntry, KeyAssignment, PromptInputLine, SpawnTabDomain,
 };
-use config::{Config, HOME_DIR};
+use config::{
+    Config, ProjectWorkspaceApplication as ConfigApplication,
+    ProjectWorkspaceLayoutNode as ConfigLayoutNode, HOME_DIR,
+};
 use mux::domain::SplitSource;
 use mux::tab::{SplitDirection, SplitRequest, SplitSize};
 use mux::Mux;
@@ -16,9 +19,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wezterm_project_workspace::{
-    default_managed_worktree_root, default_registry_path, plan_workspace, GitRepository,
-    LayoutProfile, Lifecycle, PaneRole, ProjectCatalog, Registry, RegistryWorkspace,
-    WorkspaceDescriptor, WorkspaceId, WorkspaceRequest, WorktreeSelection,
+    default_managed_worktree_root, default_registry_path, plan_workspace, ApplicationSpec,
+    GitRepository, LayoutNode, LayoutProfile, Lifecycle, PaneRole, ProjectCatalog, Registry,
+    RegistryWorkspace, SplitDirection as WorkspaceSplitDirection, WorkspaceDescriptor, WorkspaceId,
+    WorkspaceRequest, WorktreeSelection,
 };
 use wezterm_term::TerminalSize;
 
@@ -56,6 +60,85 @@ pub(crate) fn discover_projects(config: &Config) -> ProjectCatalog {
         settings.scan_depth,
         &settings.excluded_directories,
     )
+}
+
+fn configured_profile() -> anyhow::Result<LayoutProfile> {
+    let settings = &config::configuration().project_workspaces;
+    let layout = configured_layout(&settings.layout)?;
+    let applications = settings
+        .applications
+        .iter()
+        .map(configured_application)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let profile = LayoutProfile {
+        name: "configured".to_string(),
+        layout,
+        applications,
+    };
+    profile.validate()?;
+    Ok(profile)
+}
+
+fn configured_layout(node: &ConfigLayoutNode) -> anyhow::Result<LayoutNode> {
+    if let Some(role) = &node.role {
+        anyhow::ensure!(
+            node.direction.is_none()
+                && node.ratio.is_none()
+                && node.first.is_none()
+                && node.second.is_none(),
+            "project workspace pane {role:?} cannot also define a split"
+        );
+        return Ok(LayoutNode::Pane {
+            role: configured_role(role)?,
+        });
+    }
+
+    let direction = match node
+        .direction
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "horizontal" => WorkspaceSplitDirection::Horizontal,
+        "vertical" => WorkspaceSplitDirection::Vertical,
+        other => anyhow::bail!("unknown project workspace split direction {other:?}"),
+    };
+    let ratio = node
+        .ratio
+        .ok_or_else(|| anyhow::anyhow!("project workspace split is missing ratio"))?;
+    let first = node
+        .first
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("project workspace split is missing first child"))?;
+    let second = node
+        .second
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("project workspace split is missing second child"))?;
+    Ok(LayoutNode::Split {
+        direction,
+        ratio,
+        first: Box::new(configured_layout(first)?),
+        second: Box::new(configured_layout(second)?),
+    })
+}
+
+fn configured_role(role: &str) -> anyhow::Result<PaneRole> {
+    match role.to_ascii_lowercase().as_str() {
+        "agent" => Ok(PaneRole::Agent),
+        "editor" => Ok(PaneRole::Editor),
+        "review" => Ok(PaneRole::Review),
+        other => anyhow::bail!("unknown project workspace pane role {other:?}"),
+    }
+}
+
+fn configured_application(application: &ConfigApplication) -> anyhow::Result<ApplicationSpec> {
+    Ok(ApplicationSpec {
+        role: configured_role(&application.role)?,
+        launch: application.launch.clone(),
+        resume: application.resume.clone(),
+        required: application.required,
+    })
 }
 
 pub(crate) fn select_project(
@@ -146,7 +229,13 @@ pub(crate) fn select_worktree(
         selection: WorktreeSelection::Existing(worktree_path),
         managed_root,
         label: None,
-        profile: LayoutProfile::default_agentic(),
+        profile: match configured_profile() {
+            Ok(profile) => profile,
+            Err(error) => {
+                log::error!("invalid project workspace configuration: {error:#}");
+                return;
+            }
+        },
     };
     let Ok(plan) = plan_workspace(&request) else {
         log::warn!("selected path is no longer a valid Git worktree");
@@ -258,7 +347,13 @@ pub(crate) fn select_existing_branch(project_path: &str, branch: Option<String>)
         selection: WorktreeSelection::ExistingBranch { branch },
         managed_root,
         label: None,
-        profile: LayoutProfile::default_agentic(),
+        profile: match configured_profile() {
+            Ok(profile) => profile,
+            Err(error) => {
+                log::error!("invalid project workspace configuration: {error:#}");
+                return;
+            }
+        },
     };
     let Ok(plan) = plan_workspace(&request) else {
         log::warn!("unable to plan existing-branch project worktree");
@@ -303,7 +398,13 @@ pub(crate) fn select_new_branch(project_path: &str, branch: Option<String>) {
         selection: WorktreeSelection::NewBranch { branch, base_ref },
         managed_root,
         label: None,
-        profile: LayoutProfile::default_agentic(),
+        profile: match configured_profile() {
+            Ok(profile) => profile,
+            Err(error) => {
+                log::error!("invalid project workspace configuration: {error:#}");
+                return;
+            }
+        },
     };
     let Ok(plan) = plan_workspace(&request) else {
         log::warn!("unable to plan new project worktree");
@@ -363,18 +464,20 @@ async fn launch_workspace(plan: wezterm_project_workspace::WorkspacePlan) -> any
         ),
     ];
     let profile = descriptor.profile.clone();
-    let editor = application_argv(&profile, PaneRole::Editor)?;
     let agent = application_argv(&profile, PaneRole::Agent)?;
-    let review = application_argv(&profile, PaneRole::Review)?;
+    let editor = application_argv(&profile, PaneRole::Editor)?;
     // Project panes must live in the detachable persistent client domain.
     // Using the GUI-local domain would make closing the GUI kill the whole
     // project workspace instead of detaching from its persistent mux.
     let domain = SpawnTabDomain::DomainName("persistent".to_string());
-    let (_tab, editor_pane, _window_id) = mux
+    // Create the agent first so it occupies the left side, then place nvim
+    // on the right. Tuicr/review is intentionally not part of this default
+    // workspace layout.
+    let (_tab, agent_pane, _window_id) = mux
         .spawn_tab_or_window(
             None,
             domain.clone(),
-            Some(command_builder(&editor, &cwd, &environment, "editor")),
+            Some(command_builder(&agent, &cwd, &environment, "agent")),
             Some(cwd_string.clone()),
             TerminalSize::default(),
             None,
@@ -383,32 +486,16 @@ async fn launch_workspace(plan: wezterm_project_workspace::WorkspacePlan) -> any
         )
         .await?;
 
-    let (agent_pane, _) = mux
-        .split_pane(
-            editor_pane.pane_id(),
-            SplitRequest {
-                direction: SplitDirection::Horizontal,
-                target_is_second: true,
-                top_level: false,
-                size: SplitSize::Percent(35),
-            },
-            SplitSource::Spawn {
-                command: Some(command_builder(&agent, &cwd, &environment, "agent")),
-                command_dir: Some(cwd_string.clone()),
-            },
-            domain.clone(),
-        )
-        .await?;
     mux.split_pane(
         agent_pane.pane_id(),
         SplitRequest {
-            direction: SplitDirection::Vertical,
+            direction: SplitDirection::Horizontal,
             target_is_second: true,
             top_level: false,
             size: SplitSize::Percent(50),
         },
         SplitSource::Spawn {
-            command: Some(command_builder(&review, &cwd, &environment, "review")),
+            command: Some(command_builder(&editor, &cwd, &environment, "editor")),
             command_dir: Some(cwd_string),
         },
         domain,
