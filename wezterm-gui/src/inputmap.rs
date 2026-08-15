@@ -29,6 +29,11 @@ fn add_resize_default(table: &mut KeyTable, key: KeyCode, action: KeyAssignment)
 fn install_leader_defaults(keys: &mut KeyTables) {
     use KeyAssignment::*;
 
+    for index in 0..10 {
+        let key = char::from_digit(index as u32, 10).expect("workspace slot digit");
+        add_leader_default(keys, KeyCode::Char(key), SwitchWorkspaceByIndex(index));
+    }
+
     add_leader_default(
         keys,
         KeyCode::Char('h'),
@@ -948,6 +953,18 @@ mod tests {
         assert!(input_map
             .lookup_key(&KeyCode::Char('s'), Modifiers::LEADER, None)
             .is_none());
+        let mut leader_keys = KeyTables::default();
+        install_leader_defaults(&mut leader_keys);
+        for index in 0..10 {
+            let key = char::from_digit(index as u32, 10).expect("workspace slot digit");
+            assert_eq!(
+                leader_keys
+                    .default
+                    .get(&(KeyCode::Char(key), Modifiers::LEADER))
+                    .map(|entry| &entry.action),
+                Some(&KeyAssignment::SwitchWorkspaceByIndex(index))
+            );
+        }
     }
 }
 

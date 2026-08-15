@@ -545,6 +545,15 @@ impl GuiFrontEnd {
             .previous_workspace(&current)
     }
 
+    pub fn workspace_at_index(&self, index: usize) -> Option<String> {
+        let current = Mux::get().active_workspace_for_client(&self.client_id);
+        self.workspace_manager
+            .borrow_mut()
+            .picker_names(&current)
+            .get(index)
+            .cloned()
+    }
+
     pub fn record_known_window(&self, window: Window, mux_window_id: MuxWindowId) {
         let mut known_windows = self.known_windows.borrow_mut();
         if !known_windows.contains_key(&window)

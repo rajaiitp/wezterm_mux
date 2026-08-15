@@ -304,7 +304,7 @@ impl super::TermWindow {
         let mux = Mux::get();
         if let Some(window) = mux.get_window(self.mux_window_id) {
             for tab in window.iter() {
-                tab.resize(size);
+                tab.resize_layout(size);
             }
         };
         // Resize pane content before the next frame is painted. Doing this in

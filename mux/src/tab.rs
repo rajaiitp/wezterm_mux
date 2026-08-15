@@ -623,6 +623,17 @@ impl Tab {
         self.inner.lock().resize(size)
     }
 
+    /// Update the tab and split-tree geometry without resizing the leaf panes.
+    ///
+    /// The GUI uses this when pane content padding is enabled: the split tree
+    /// must cover the full terminal surface, while each PTY is intentionally
+    /// smaller. Resizing the tab normally would first send full-size pane
+    /// resizes and then a second set of padded resizes, which can race for a
+    /// remote mux and corrupt the retained split geometry.
+    pub fn resize_layout(&self, size: TerminalSize) {
+        self.inner.lock().resize_layout(size)
+    }
+
     /// Called when running in the mux server after an individual pane
     /// has been resized.
     /// Because the split manipulation happened on the GUI we "lost"
@@ -1146,6 +1157,43 @@ impl TabInner {
 
     fn get_size(&self) -> TerminalSize {
         self.size
+    }
+
+    fn resize_layout(&mut self, size: TerminalSize) {
+        if size.rows == 0 || size.cols == 0 || self.size == size {
+            return;
+        }
+
+        if self.zoomed.is_some() {
+            self.size = size;
+        } else {
+            let dims = cell_dimensions(&size);
+            let (min_x, min_y) = compute_min_size(self.pane.as_mut().unwrap());
+            let current_size = self.size;
+            let cols = size.cols.max(min_x);
+            let rows = size.rows.max(min_y);
+            let size = TerminalSize {
+                rows,
+                cols,
+                pixel_width: cols * dims.pixel_width,
+                pixel_height: rows * dims.pixel_height,
+                dpi: dims.dpi,
+            };
+
+            adjust_x_size(
+                self.pane.as_mut().unwrap(),
+                cols as isize - current_size.cols as isize,
+                &dims,
+            );
+            adjust_y_size(
+                self.pane.as_mut().unwrap(),
+                rows as isize - current_size.rows as isize,
+                &dims,
+            );
+            self.size = size;
+        }
+
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
     }
 
     fn resize(&mut self, size: TerminalSize) {

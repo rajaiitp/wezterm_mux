@@ -1962,6 +1962,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
                 icon: None,
             }
         }
+        SwitchWorkspaceByIndex(index) => CommandDef {
+            brief: format!("Switch to workspace slot {index}").into(),
+            doc: format!("Switch to the workspace at persisted-order slot {index}").into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Window", "Workspace"],
+            icon: None,
+        },
         ActivateKeyTable { name, .. } => CommandDef {
             brief: format!("Activate key table `{name}`").into(),
             doc: format!("Activate key table `{name}`").into(),

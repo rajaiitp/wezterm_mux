@@ -1403,7 +1403,7 @@ impl TermWindow {
                                     tab_id,
                                     self.terminal_size
                                 );
-                                tab.resize(self.terminal_size);
+                                tab.resize_layout(self.terminal_size);
                             }
                         } else {
                             // If we attached to a remote domain and loaded in
@@ -1420,7 +1420,7 @@ impl TermWindow {
                                 self.set_window_size(size, window)?;
                             } else if tab_size.dpi == 0 {
                                 log::debug!("fixup dpi in newly added tab");
-                                tab.resize(self.terminal_size);
+                                tab.resize_layout(self.terminal_size);
                             }
                         }
                     }
@@ -1513,7 +1513,7 @@ impl TermWindow {
                 let mux = Mux::get();
                 if let Some(window) = mux.get_window(self.mux_window_id) {
                     for tab in window.iter() {
-                        tab.resize(self.terminal_size);
+                        tab.resize_layout(self.terminal_size);
                     }
                 };
                 self.update_title();
@@ -3440,6 +3440,17 @@ impl TermWindow {
                     front_end().switch_workspace(w, false);
                 }
             }
+            SwitchWorkspaceByIndex(index) => {
+                if let Some(name) = front_end().workspace_at_index(*index) {
+                    let mux = Mux::get();
+                    let create = !mux.workspace_exists(&name);
+                    let action = KeyAssignment::SwitchToWorkspace {
+                        name: Some(name),
+                        spawn: create.then(SpawnCommand::default),
+                    };
+                    return self.perform_key_assignment(pane, &action);
+                }
+            }
             SwitchToWorkspace { name, spawn } => {
                 let activity = crate::Activity::new();
                 let mux = Mux::get();
@@ -4016,7 +4027,7 @@ impl TermWindow {
                 tab_size,
                 self.terminal_size
             );
-            tab.resize(self.terminal_size);
+            tab.resize_layout(self.terminal_size);
         }
     }
 

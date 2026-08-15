@@ -636,6 +636,8 @@ pub enum KeyAssignment {
         spawn: Option<SpawnCommand>,
     },
     SwitchWorkspaceRelative(isize),
+    /// Switch to the workspace at the given native persisted-order index.
+    SwitchWorkspaceByIndex(usize),
 
     ActivateKeyTable {
         name: String,
