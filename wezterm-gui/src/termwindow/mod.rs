@@ -158,6 +158,10 @@ pub enum TermWindowNotif {
         assignment: KeyAssignment,
         tx: Option<Sender<anyhow::Result<()>>>,
     },
+    DeleteWorkspace {
+        pane_id: PaneId,
+        workspace: String,
+    },
     SetLeftStatus(String),
     SetRightStatus(String),
     SetRightStatusClickTargets(Vec<String>),
@@ -1296,6 +1300,22 @@ impl TermWindow {
                 if let Some(tx) = tx {
                     tx.try_send(result).ok();
                 }
+            }
+            TermWindowNotif::DeleteWorkspace {
+                pane_id,
+                workspace,
+            } => {
+                self.cancel_overlay_for_pane(pane_id);
+                crate::overlay::selector::trampoline(
+                    crate::workspace::WORKSPACE_DELETE_EVENT.to_string(),
+                    GuiWin::new(self),
+                    MuxPane(pane_id),
+                    Some(InputSelectorEntry {
+                        label: workspace.clone(),
+                        id: Some(workspace),
+                    }),
+                );
+                window.invalidate();
             }
             TermWindowNotif::SetRightStatus(status) => {
                 if status != self.right_status {
@@ -2687,7 +2707,9 @@ impl TermWindow {
             alphabet: Default::default(),
             description: Default::default(),
             fuzzy_description: Default::default(),
-            delete_action: None,
+            delete_action: Some(Box::new(KeyAssignment::EmitEvent(
+                crate::workspace::WORKSPACE_DELETE_EVENT.to_string(),
+            ))),
         });
     }
 

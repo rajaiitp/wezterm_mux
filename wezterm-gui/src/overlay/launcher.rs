@@ -490,6 +490,24 @@ impl LauncherState {
         }
     }
 
+    fn delete_selected_workspace(&self) -> bool {
+        let Some(entry) = self.filtered_entries.get(self.active_idx) else {
+            return false;
+        };
+        let KeyAssignment::SwitchToWorkspace {
+            name: Some(workspace),
+            ..
+        } = &entry.action
+        else {
+            return false;
+        };
+        self.window.notify(TermWindowNotif::DeleteWorkspace {
+            pane_id: self.pane_id,
+            workspace: workspace.clone(),
+        });
+        true
+    }
+
     fn move_up(&mut self) {
         self.active_idx = self.active_idx.saturating_sub(1);
         if self.active_idx < self.top_row {
@@ -539,6 +557,14 @@ impl LauncherState {
                     modifiers: Modifiers::CTRL,
                 }) => {
                     self.move_up();
+                }
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('d'),
+                    modifiers: Modifiers::CTRL,
+                }) => {
+                    if self.delete_selected_workspace() {
+                        break;
+                    }
                 }
                 InputEvent::Key(KeyEvent {
                     key: KeyCode::Char('N' | 'J'),

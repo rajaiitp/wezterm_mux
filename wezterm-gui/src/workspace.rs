@@ -13,6 +13,7 @@ use wezterm_project_workspace::{default_registry_path, Registry, WorkspaceId};
 
 pub const DEFAULT_WORKSPACE: &str = "default";
 pub const WORKSPACE_PICKER_EVENT: &str = "__wezterm_workspace_picker";
+pub const WORKSPACE_DELETE_EVENT: &str = "__wezterm_workspace_delete";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 struct LastTab {
