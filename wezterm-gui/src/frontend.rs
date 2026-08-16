@@ -542,11 +542,16 @@ impl GuiFrontEnd {
     }
 
     pub fn workspace_at_index(&self, index: usize) -> Option<String> {
+        // Ctrl+B 0 targets the hidden default scratchpad. Visible workspaces
+        // occupy slots 1..N in their persisted ordering.
+        if index == 0 {
+            return Some(crate::workspace::DEFAULT_WORKSPACE.to_string());
+        }
         let current = Mux::get().active_workspace_for_client(&self.client_id);
         self.workspace_manager
             .borrow_mut()
             .picker_names(&current)
-            .get(index)
+            .get(index - 1)
             .cloned()
     }
 

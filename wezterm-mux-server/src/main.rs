@@ -20,7 +20,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use wezterm_gui_subcommands::*;
 use wezterm_mux_server_impl::update_mux_domains_for_server;
 use wezterm_session_state::{self as session_state, SessionSnapshot};
@@ -329,8 +329,11 @@ fn start_native_autosave() {
     let interval = env::var("WEZTERM_HERDR_NATIVE_SESSION_INTERVAL")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(300)
-        .max(10);
+        // Keep a recent rolling snapshot so a crash or forced restart can
+        // recover project applications even when the user did not run the
+        // explicit restart helper.
+        .unwrap_or(15)
+        .max(5);
     let dirty = Arc::new(AtomicBool::new(true));
     let periodic_dirty = Arc::clone(&dirty);
     Mux::get().subscribe_persistence(move |notification| {
@@ -399,31 +402,149 @@ fn shell_command(config: &config::ConfigHandle) -> Option<Vec<OsString>> {
 }
 
 fn restore_command(entry: &PaneEntry, _config: &config::ConfigHandle) -> Option<CommandBuilder> {
-    let process = entry.process.as_ref()?;
-    let candidates = [&process.name, &process.executable];
-    let name = candidates
-        .iter()
-        .map(|value| {
-            Path::new(value)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(value)
-        })
-        .find(|value| {
-            [
-                "nvim", "vim", "vi", "neovim", "pi", "claude", "codex", "tuxedo", "tuicr",
-            ]
-            .iter()
-            .any(|known| *value == *known || value.starts_with(&format!("{known}.")))
-        })?;
-    let argv = if !process.argv.is_empty() {
-        process.argv.iter().map(OsString::from).collect()
-    } else if !process.executable.is_empty() {
-        vec![OsString::from(&process.executable)]
+    let process = project_app_process(entry.process.as_ref()?);
+    let command = if is_app(&process, &["nvim", "vim", "vi", "neovim"]) {
+        editor_restore_command(&process)
+    } else if is_app(&process, &["pi"]) {
+        pi_restore_command(entry, &process)
+    } else if is_app(&process, &["claude", "codex", "tuxedo", "tuicr"]) {
+        recorded_restore_command(&process)
     } else {
-        vec![OsString::from(name)]
+        return None;
     };
-    Some(CommandBuilder::from_argv(argv))
+    Some(CommandBuilder::from_argv(shell_backed_argv(command)))
+}
+
+fn project_app_process(process: &mux::tab::PaneProcessInfo) -> mux::tab::PaneProcessInfo {
+    let Some(marker) = process
+        .argv
+        .iter()
+        .position(|arg| arg == "wezterm-project-app")
+    else {
+        return process.clone();
+    };
+    let argv = process.argv.iter().skip(marker + 1).cloned().collect::<Vec<_>>();
+    let Some(executable) = argv.first() else {
+        return process.clone();
+    };
+    let name = Path::new(executable)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(executable)
+        .to_string();
+    mux::tab::PaneProcessInfo {
+        name,
+        executable: executable.clone(),
+        argv,
+        cwd: process.cwd.clone(),
+    }
+}
+
+fn shell_backed_argv(command: Vec<OsString>) -> Vec<OsString> {
+    let mut argv = vec![
+        OsString::from("/bin/sh"),
+        OsString::from("-lc"),
+        OsString::from(r#""$@"; exec "${SHELL:-/bin/sh}" -l"#),
+        OsString::from("wezterm-project-app"),
+    ];
+    argv.extend(command);
+    argv
+}
+
+fn recorded_restore_command(process: &mux::tab::PaneProcessInfo) -> Vec<OsString> {
+    if !process.argv.is_empty() {
+        return process.argv.iter().map(OsString::from).collect();
+    }
+    let executable = if process.executable.is_empty() {
+        if process.name.is_empty() { "sh" } else { process.name.as_str() }
+    } else {
+        &process.executable
+    };
+    vec![OsString::from(executable)]
+}
+
+fn editor_restore_command(process: &mux::tab::PaneProcessInfo) -> Vec<OsString> {
+    let executable = if process.executable.is_empty() {
+        if process.name.is_empty() { OsString::from("nvim") } else { OsString::from(&process.name) }
+    } else {
+        OsString::from(&process.executable)
+    };
+    let mut args: Vec<OsString> = process
+        .argv
+        .iter()
+        .filter(|arg| arg.as_str() != "--embed")
+        .map(OsString::from)
+        .collect();
+    let argv_has_editor = args
+        .first()
+        .and_then(|arg| Path::new(arg).file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| ["nvim", "vim", "vi", "neovim"].iter().any(|editor| {
+            name == *editor || name.starts_with(&format!("{editor}."))
+        }))
+        .unwrap_or(false);
+    if !argv_has_editor {
+        args.insert(0, executable);
+    }
+    if args.is_empty() {
+        args.push(OsString::from("nvim"));
+    }
+    args
+}
+
+fn is_app(process: &mux::tab::PaneProcessInfo, names: &[&str]) -> bool {
+    let mut values = Vec::with_capacity(process.argv.len() + 2);
+    values.push(process.name.as_str());
+    values.push(process.executable.as_str());
+    values.extend(process.argv.iter().map(String::as_str));
+    values.iter().any(|value| {
+        let value = value.to_ascii_lowercase();
+        let basename = Path::new(&value)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(value.as_str());
+        names.iter().any(|name| {
+            basename == *name
+                || basename.starts_with(&format!("{name}."))
+                || basename == format!("{name}.exe")
+        })
+    })
+}
+
+fn pi_restore_command(entry: &PaneEntry, process: &mux::tab::PaneProcessInfo) -> Vec<OsString> {
+    if process
+        .argv
+        .iter()
+        .any(|arg| arg == "--session" || arg == "--no-session" || arg == "--fork")
+    {
+        return process.argv.iter().map(OsString::from).collect();
+    }
+    if let Some(path) = latest_pi_session(entry, process) {
+        return vec![OsString::from("pi"), OsString::from("--session"), path.into_os_string()];
+    }
+    vec![OsString::from("pi"), OsString::from("-c")]
+}
+
+fn latest_pi_session(entry: &PaneEntry, process: &mux::tab::PaneProcessInfo) -> Option<PathBuf> {
+    let cwd = if process.cwd.is_empty() {
+        entry.working_dir.as_ref()?.url.to_file_path().ok()?
+    } else {
+        PathBuf::from(&process.cwd)
+    };
+    let home = dirs_next::home_dir()?;
+    let encoded = cwd.to_string_lossy().trim_start_matches('/').replace('/', "-");
+    let session_dir = home
+        .join(".pi")
+        .join("agent")
+        .join("sessions")
+        .join(format!("--{encoded}--"));
+    fs::read_dir(session_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .max_by_key(|(modified, _)| modified.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default())
+        .map(|(_, path)| path)
 }
 
 fn split_for(entry: &PaneEntry, restored: &[RestoredPane]) -> (mux::pane::PaneId, SplitRequest) {

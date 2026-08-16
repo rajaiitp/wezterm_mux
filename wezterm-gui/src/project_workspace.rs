@@ -7,22 +7,19 @@
 use config::keyassignment::{
     InputSelector, InputSelectorEntry, KeyAssignment, PromptInputLine, SpawnTabDomain,
 };
-use config::{
-    Config, ProjectWorkspaceApplication as ConfigApplication,
-    ProjectWorkspaceLayoutNode as ConfigLayoutNode, HOME_DIR,
-};
-use mux::domain::SplitSource;
-use mux::tab::{SplitDirection, SplitRequest, SplitSize};
+use config::{Config, ProjectWorkspaceApplication as ConfigApplication, HOME_DIR};
+use mux::domain::{ProjectLayoutRequest, ProjectPaneSpec};
+use mux::tab::ProjectLayout;
 use mux::Mux;
 use portable_pty::CommandBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wezterm_project_workspace::{
     default_managed_worktree_root, default_registry_path, plan_workspace, ApplicationSpec,
-    GitRepository, LayoutNode, LayoutProfile, Lifecycle, PaneRole, ProjectCatalog, Registry,
-    RegistryWorkspace, SplitDirection as WorkspaceSplitDirection, WorkspaceDescriptor, WorkspaceId,
-    WorkspaceRequest, WorktreeSelection,
+    GitRepository, LayoutProfile, Lifecycle, PaneRole, ProjectCatalog, Registry, RegistryWorkspace,
+    WorkspaceDescriptor, WorkspaceId, WorkspaceRequest, WorktreeSelection,
 };
 use wezterm_term::TerminalSize;
 
@@ -64,14 +61,16 @@ pub(crate) fn discover_projects(config: &Config) -> ProjectCatalog {
 
 fn configured_profile() -> anyhow::Result<LayoutProfile> {
     let settings = &config::configuration().project_workspaces;
-    let layout = configured_layout(&settings.layout)?;
+    let layout = settings.layout.trim().to_ascii_lowercase();
+    ProjectLayout::from_str(&layout)
+        .map_err(|error| anyhow::anyhow!("invalid project workspace layout: {error}"))?;
     let applications = settings
         .applications
         .iter()
         .map(configured_application)
         .collect::<anyhow::Result<Vec<_>>>()?;
     let profile = LayoutProfile {
-        name: "configured".to_string(),
+        name: layout.clone(),
         layout,
         applications,
     };
@@ -79,55 +78,12 @@ fn configured_profile() -> anyhow::Result<LayoutProfile> {
     Ok(profile)
 }
 
-fn configured_layout(node: &ConfigLayoutNode) -> anyhow::Result<LayoutNode> {
-    if let Some(role) = &node.role {
-        anyhow::ensure!(
-            node.direction.is_none()
-                && node.ratio.is_none()
-                && node.first.is_none()
-                && node.second.is_none(),
-            "project workspace pane {role:?} cannot also define a split"
-        );
-        return Ok(LayoutNode::Pane {
-            role: configured_role(role)?,
-        });
-    }
-
-    let direction = match node
-        .direction
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "horizontal" => WorkspaceSplitDirection::Horizontal,
-        "vertical" => WorkspaceSplitDirection::Vertical,
-        other => anyhow::bail!("unknown project workspace split direction {other:?}"),
-    };
-    let ratio = node
-        .ratio
-        .ok_or_else(|| anyhow::anyhow!("project workspace split is missing ratio"))?;
-    let first = node
-        .first
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("project workspace split is missing first child"))?;
-    let second = node
-        .second
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("project workspace split is missing second child"))?;
-    Ok(LayoutNode::Split {
-        direction,
-        ratio,
-        first: Box::new(configured_layout(first)?),
-        second: Box::new(configured_layout(second)?),
-    })
-}
-
 fn configured_role(role: &str) -> anyhow::Result<PaneRole> {
     match role.to_ascii_lowercase().as_str() {
         "agent" => Ok(PaneRole::Agent),
         "editor" => Ok(PaneRole::Editor),
         "review" => Ok(PaneRole::Review),
+        "terminal" => Ok(PaneRole::Terminal),
         other => anyhow::bail!("unknown project workspace pane role {other:?}"),
     }
 }
@@ -464,41 +420,33 @@ async fn launch_workspace(plan: wezterm_project_workspace::WorkspacePlan) -> any
         ),
     ];
     let profile = descriptor.profile.clone();
-    let agent = application_argv(&profile, PaneRole::Agent)?;
-    let editor = application_argv(&profile, PaneRole::Editor)?;
-    // Project panes must live in the detachable persistent client domain.
-    // Using the GUI-local domain would make closing the GUI kill the whole
-    // project workspace instead of detaching from its persistent mux.
-    let domain = SpawnTabDomain::DomainName("persistent".to_string());
-    // Create the agent first so it occupies the left side, then place nvim
-    // on the right. Tuicr/review is intentionally not part of this default
-    // workspace layout.
-    let (_tab, agent_pane, _window_id) = mux
-        .spawn_tab_or_window(
-            None,
-            domain.clone(),
-            Some(command_builder(&agent, &cwd, &environment, "agent")),
-            Some(cwd_string.clone()),
-            TerminalSize::default(),
-            None,
-            workspace.clone(),
-            None,
-        )
-        .await?;
+    let layout = ProjectLayout::from_str(&profile.layout)
+        .map_err(|error| anyhow::anyhow!("invalid project layout {:?}: {error}", profile.layout))?;
+    let panes = profile
+        .applications
+        .iter()
+        .map(|application| ProjectPaneSpec {
+            command: Some(command_builder(
+                &application.launch,
+                &cwd,
+                &environment,
+                application.role.as_str(),
+            )),
+            command_dir: Some(cwd_string.clone()),
+        })
+        .collect();
 
-    mux.split_pane(
-        agent_pane.pane_id(),
-        SplitRequest {
-            direction: SplitDirection::Horizontal,
-            target_is_second: true,
-            top_level: false,
-            size: SplitSize::Percent(50),
+    // The mux provisions the entire workspace in one operation. The GUI only
+    // supplies module commands and the named topology; all split sizing and
+    // pane geometry stay on the mux side.
+    mux.spawn_project_layout(
+        SpawnTabDomain::DomainName("persistent".to_string()),
+        ProjectLayoutRequest {
+            workspace: workspace.clone(),
+            size: TerminalSize::default(),
+            layout,
+            panes,
         },
-        SplitSource::Spawn {
-            command: Some(command_builder(&editor, &cwd, &environment, "editor")),
-            command_dir: Some(cwd_string),
-        },
-        domain,
     )
     .await?;
 
@@ -599,22 +547,23 @@ fn update_registry_workspace_label(id: &WorkspaceId, label: &str) {
     }
 }
 
-fn application_argv(profile: &LayoutProfile, role: PaneRole) -> anyhow::Result<Vec<String>> {
-    profile
-        .applications
-        .iter()
-        .find(|application| application.role == role)
-        .map(|application| application.launch.clone())
-        .ok_or_else(|| anyhow::anyhow!("layout profile has no {} application", role.as_str()))
-}
-
 fn command_builder(
     argv: &[String],
     cwd: &Path,
     environment: &[(&str, String)],
     role: &str,
 ) -> CommandBuilder {
-    let mut builder = CommandBuilder::from_argv(argv.iter().cloned().map(Into::into).collect());
+    // Keep the pane's normal shell as the long-lived process. The application
+    // is a foreground child, so closing nvim/pi/tuicr returns to the shell
+    // instead of causing the mux to remove the pane.
+    let mut command = vec![
+        "/bin/sh".to_string(),
+        "-lc".to_string(),
+        r#""$@"; exec "${SHELL:-/bin/sh}" -l"#.to_string(),
+        "wezterm-project-app".to_string(),
+    ];
+    command.extend(argv.iter().cloned());
+    let mut builder = CommandBuilder::from_argv(command.into_iter().map(Into::into).collect());
     builder.cwd(cwd);
     for (key, value) in environment {
         builder.env(key, value);

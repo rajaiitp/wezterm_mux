@@ -16,7 +16,7 @@ use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use mux::client::{ClientId, ClientInfo};
 use mux::pane::PaneId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use mux::tab::{PaneNode, SerdeUrl, SplitRequest, TabId};
+use mux::tab::{PaneNode, ProjectLayout, SerdeUrl, SplitRequest, TabId};
 use mux::window::WindowId;
 use portable_pty::CommandBuilder;
 use rangeset::*;
@@ -505,6 +505,7 @@ pdu! {
     GetPaneExitStatus: 63,
     SetClientWorkspace: 65,
     GetPaneExitStatusResponse: 64,
+    SpawnProject: 66,
 }
 
 impl Pdu {
@@ -520,7 +521,8 @@ impl Pdu {
             | Self::Resize(_)
             | Self::SetClipboard(_)
             | Self::SetPaneZoomed(_)
-            | Self::SpawnV2(_) => true,
+            | Self::SpawnV2(_)
+            | Self::SpawnProject(_) => true,
             _ => false,
         }
     }
@@ -693,6 +695,22 @@ pub struct SpawnV2 {
     pub command_dir: Option<String>,
     pub size: TerminalSize,
     pub workspace: String,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SpawnProjectPane {
+    pub command: Option<CommandBuilder>,
+    pub command_dir: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SpawnProject {
+    pub workspace: String,
+    pub size: TerminalSize,
+    pub layout: ProjectLayout,
+    pub panes: Vec<SpawnProjectPane>,
+    #[serde(default)]
+    pub create_workspace: bool,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

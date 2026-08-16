@@ -14,6 +14,7 @@ async_ossl.workspace = true
 clap.workspace = true
 codec.workspace = true
 config.workspace = true
+dirs-next.workspace = true
 env-bootstrap.workspace = true
 libc.workspace = true
 log.workspace = true

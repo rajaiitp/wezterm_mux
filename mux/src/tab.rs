@@ -98,6 +98,32 @@ pub enum SplitDirection {
     Vertical,
 }
 
+/// Fixed project topologies. The mux computes all split cell sizes from the
+/// tab geometry; callers only select the topology and provide pane commands.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProjectLayout {
+    Single,
+    Columns,
+    Rows,
+    ThreePane,
+    Grid,
+}
+
+impl std::str::FromStr for ProjectLayout {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "single" => Ok(Self::Single),
+            "columns" | "column" => Ok(Self::Columns),
+            "rows" | "row" => Ok(Self::Rows),
+            "three-pane" | "three_pane" | "three" => Ok(Self::ThreePane),
+            "grid" => Ok(Self::Grid),
+            other => Err(format!("unknown project layout {other:?}")),
+        }
+    }
+}
+
 /// The size is of the (first, second) child of the split
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SplitDirectionAndSize {
@@ -687,6 +713,57 @@ impl Tab {
 
     pub fn get_size(&self) -> TerminalSize {
         self.inner.lock().get_size()
+    }
+
+    /// Return the next mux-owned split operation for a fixed project layout.
+    /// `step` is the zero-based index of the pane being added and `total` is
+    /// the final pane count. The returned source index is topological, not a
+    /// GUI-specific coordinate.
+    pub fn project_layout_split(
+        &self,
+        layout: ProjectLayout,
+        step: usize,
+        total: usize,
+    ) -> Option<(usize, SplitRequest)> {
+        if total < 2 || step == 0 || step >= total || total > 4 {
+            return None;
+        }
+
+        let source = self.iter_panes().into_iter().next()?;
+        let remaining = total.saturating_sub(step).saturating_add(1).max(1);
+        // Split the accumulated first column/row. Deriving the target from
+        // that pane, rather than the whole tab, keeps repeated columns/rows
+        // equal after each divider cell is accounted for.
+        let equal_columns = || SplitSize::Cells((source.width / remaining).max(1));
+        let equal_rows = || SplitSize::Cells((source.height / remaining).max(1));
+        let split = |direction, source_index, split_size| {
+            Some((
+                source_index,
+                SplitRequest {
+                    direction,
+                    target_is_second: true,
+                    top_level: false,
+                    size: split_size,
+                },
+            ))
+        };
+
+        match layout {
+            ProjectLayout::Single => None,
+            ProjectLayout::Columns => split(SplitDirection::Horizontal, 0, equal_columns()),
+            ProjectLayout::Rows => split(SplitDirection::Vertical, 0, equal_rows()),
+            ProjectLayout::ThreePane => match step {
+                1 => split(SplitDirection::Horizontal, 0, SplitSize::Percent(50)),
+                2 if total >= 3 => split(SplitDirection::Vertical, 1, SplitSize::Percent(50)),
+                _ => None,
+            },
+            ProjectLayout::Grid => match step {
+                1 => split(SplitDirection::Horizontal, 0, SplitSize::Percent(50)),
+                2 => split(SplitDirection::Vertical, 0, SplitSize::Percent(50)),
+                3 if total == 4 => split(SplitDirection::Vertical, 2, SplitSize::Percent(50)),
+                _ => None,
+            },
+        }
     }
 
     /// Apply the new size of the tab to the panes contained within.
@@ -2923,6 +3000,41 @@ mod test {
                 assert!(!overlaps, "split panes overlap: {:?} and {:?}", left, right);
             }
         }
+    }
+
+    #[test]
+    fn named_project_layouts_return_mux_owned_split_requests() {
+        let size = TerminalSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 1000,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        let (source, columns) = tab
+            .project_layout_split(ProjectLayout::Columns, 1, 3)
+            .unwrap();
+        assert_eq!(source, 0);
+        assert_eq!(columns.direction, SplitDirection::Horizontal);
+        assert_eq!(columns.size, SplitSize::Cells(40));
+
+        let (source, rows) = tab
+            .project_layout_split(ProjectLayout::Rows, 1, 4)
+            .unwrap();
+        assert_eq!(source, 0);
+        assert_eq!(rows.direction, SplitDirection::Vertical);
+        assert_eq!(rows.size, SplitSize::Cells(10));
+
+        let (source, grid) = tab
+            .project_layout_split(ProjectLayout::Grid, 3, 4)
+            .unwrap();
+        assert_eq!(source, 2);
+        assert_eq!(grid.direction, SplitDirection::Vertical);
+        assert_eq!(grid.size, SplitSize::Percent(50));
+        assert!(tab.project_layout_split(ProjectLayout::Single, 1, 2).is_none());
     }
 
     #[test]

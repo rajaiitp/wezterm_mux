@@ -15,7 +15,7 @@ mod types;
 
 pub use catalog::{CatalogCandidate, CatalogSource, ProjectCatalog};
 pub use git::{parse_worktree_list, GitRepository, GitWorktree, GitWorktreeState};
-pub use layout::{ApplicationSpec, LayoutNode, LayoutProfile, PaneRole, SplitDirection};
+pub use layout::{ApplicationSpec, LayoutProfile, PaneRole};
 pub use path::{default_managed_worktree_root, managed_worktree_path, validate_managed_path};
 pub use plan::{workspace_id_for_worktree, ExistingBranchPlan, NewBranchPlan, WorktreePlan};
 pub use registry::{default_registry_path, ProjectRecord, Registry, RegistryWorkspace};

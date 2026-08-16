@@ -394,9 +394,9 @@ impl WorkspaceManager {
 }
 
 fn picker_names_from(mut names: Vec<String>, active: &str, active_is_live: bool) -> Vec<String> {
-    if !names.iter().any(|name| name == DEFAULT_WORKSPACE) {
-        names.insert(0, DEFAULT_WORKSPACE.to_string());
-    }
+    // Workspace 0 is a permanent hidden scratchpad. Keep it out of visible
+    // lists so the first displayed workspace remains slot 1.
+    names.retain(|name| name != DEFAULT_WORKSPACE);
     if !names.iter().any(|name| name == active) && active != DEFAULT_WORKSPACE && active_is_live {
         names.push(active.to_string());
     }
@@ -469,10 +469,14 @@ mod tests {
     use super::{picker_names_from, DEFAULT_WORKSPACE};
 
     #[test]
-    fn picker_includes_default_workspace() {
+    fn picker_hides_default_workspace() {
         assert_eq!(
-            picker_names_from(vec!["project".to_string()], DEFAULT_WORKSPACE, false),
-            vec!["default", "project"]
+            picker_names_from(
+                vec![DEFAULT_WORKSPACE.to_string(), "project".to_string()],
+                DEFAULT_WORKSPACE,
+                false,
+            ),
+            vec!["project"]
         );
     }
 
@@ -480,7 +484,7 @@ mod tests {
     fn picker_adds_an_unordered_live_workspace() {
         assert_eq!(
             picker_names_from(vec![DEFAULT_WORKSPACE.to_string()], "live", true),
-            vec!["default", "live"]
+            vec!["live"]
         );
     }
 }

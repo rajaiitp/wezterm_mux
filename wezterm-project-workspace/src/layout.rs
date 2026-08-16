@@ -1,17 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SplitDirection {
-    Horizontal,
-    Vertical,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaneRole {
     Editor,
     Agent,
     Review,
+    Terminal,
 }
 
 impl PaneRole {
@@ -20,22 +15,9 @@ impl PaneRole {
             Self::Editor => "editor",
             Self::Agent => "agent",
             Self::Review => "review",
+            Self::Terminal => "terminal",
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum LayoutNode {
-    Pane {
-        role: PaneRole,
-    },
-    Split {
-        direction: SplitDirection,
-        /// Fraction assigned to the first child. Must be in (0, 1).
-        ratio: f32,
-        first: Box<LayoutNode>,
-        second: Box<LayoutNode>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,43 +30,21 @@ pub struct ApplicationSpec {
     pub required: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A named layout selected by configuration. The mux owns the actual cell
+/// sizing and split tree; this crate only validates the workflow description.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutProfile {
     pub name: String,
-    pub layout: LayoutNode,
+    pub layout: String,
     pub applications: Vec<ApplicationSpec>,
 }
 
 impl LayoutProfile {
     pub fn default_agentic() -> Self {
         Self {
-            name: "agentic".to_string(),
-            // Provisional profile. The pane topology remains configurable and
-            // can be changed without changing workspace identity.
-            layout: LayoutNode::Split {
-                direction: SplitDirection::Horizontal,
-                ratio: 0.65,
-                first: Box::new(LayoutNode::Pane {
-                    role: PaneRole::Editor,
-                }),
-                second: Box::new(LayoutNode::Split {
-                    direction: SplitDirection::Vertical,
-                    ratio: 0.5,
-                    first: Box::new(LayoutNode::Pane {
-                        role: PaneRole::Agent,
-                    }),
-                    second: Box::new(LayoutNode::Pane {
-                        role: PaneRole::Review,
-                    }),
-                }),
-            },
+            name: "columns".to_string(),
+            layout: "columns".to_string(),
             applications: vec![
-                ApplicationSpec {
-                    role: PaneRole::Editor,
-                    launch: vec!["nvim".to_string(), ".".to_string()],
-                    resume: None,
-                    required: true,
-                },
                 ApplicationSpec {
                     role: PaneRole::Agent,
                     launch: vec!["pi".to_string(), "--continue".to_string()],
@@ -92,12 +52,8 @@ impl LayoutProfile {
                     required: true,
                 },
                 ApplicationSpec {
-                    role: PaneRole::Review,
-                    launch: vec![
-                        "tuicr".to_string(),
-                        "--working-tree".to_string(),
-                        "--no-update-check".to_string(),
-                    ],
+                    role: PaneRole::Editor,
+                    launch: vec!["nvim".to_string(), ".".to_string()],
                     resume: None,
                     required: true,
                 },
@@ -106,50 +62,45 @@ impl LayoutProfile {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        let mut layout_roles = BTreeSet::new();
-        collect_roles(&self.layout, &mut layout_roles)?;
-        let app_roles = self
-            .applications
-            .iter()
-            .map(|app| app.role.as_str())
-            .collect::<BTreeSet<_>>();
-        if layout_roles != app_roles {
-            anyhow::bail!(
-                "layout roles {:?} do not match application roles {:?}",
-                layout_roles,
-                app_roles
+        let layout = self.layout.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            matches!(layout.as_str(), "single" | "columns" | "rows" | "three-pane" | "grid"),
+            "unknown project layout {layout:?}"
+        );
+        anyhow::ensure!(!self.applications.is_empty(), "project layout has no modules");
+        anyhow::ensure!(
+            self.applications.len() <= 4,
+            "project layouts support at most four modules"
+        );
+
+        let mut app_roles = BTreeSet::new();
+        for app in &self.applications {
+            anyhow::ensure!(
+                app_roles.insert(app.role.as_str()),
+                "project layout contains duplicate {} module",
+                app.role.as_str()
+            );
+            anyhow::ensure!(
+                !app.launch.is_empty() && app.launch.iter().all(|arg| !arg.is_empty()),
+                "application {} has an empty launch argv",
+                app.role.as_str()
             );
         }
-        for app in &self.applications {
-            if app.launch.is_empty() || app.launch.iter().any(String::is_empty) {
-                anyhow::bail!("application {} has an empty launch argv", app.role.as_str());
-            }
+
+        if layout == "single" {
+            anyhow::ensure!(
+                self.applications.len() == 1,
+                "single layout requires exactly one module"
+            );
+        }
+        if layout == "three-pane" {
+            anyhow::ensure!(
+                self.applications.len() <= 3,
+                "three-pane layout supports at most three modules"
+            );
         }
         Ok(())
     }
-}
-
-fn collect_roles(node: &LayoutNode, roles: &mut BTreeSet<&'static str>) -> anyhow::Result<()> {
-    match node {
-        LayoutNode::Pane { role } => {
-            if !roles.insert(role.as_str()) {
-                anyhow::bail!("layout contains duplicate {} pane", role.as_str());
-            }
-        }
-        LayoutNode::Split {
-            ratio,
-            first,
-            second,
-            ..
-        } => {
-            if !ratio.is_finite() || !(0.0..1.0).contains(ratio) {
-                anyhow::bail!("layout split ratio must be finite and between 0 and 1");
-            }
-            collect_roles(first, roles)?;
-            collect_roles(second, roles)?;
-        }
-    }
-    Ok(())
 }
 
 fn default_true() -> bool {
@@ -161,22 +112,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_profile_is_valid_and_has_three_roles() {
-        let profile = LayoutProfile::default_agentic();
-        profile.validate().unwrap();
-        assert_eq!(profile.applications.len(), 3);
+    fn default_profile_is_valid() {
+        LayoutProfile::default_agentic().validate().unwrap();
     }
 
     #[test]
-    fn invalid_ratios_and_duplicate_roles_are_rejected() {
+    fn validates_named_layouts_without_ratios() {
+        let profile = LayoutProfile {
+            name: "grid".to_string(),
+            layout: "grid".to_string(),
+            applications: vec![
+                ApplicationSpec {
+                    role: PaneRole::Editor,
+                    launch: vec!["nvim".to_string()],
+                    resume: None,
+                    required: true,
+                },
+                ApplicationSpec {
+                    role: PaneRole::Agent,
+                    launch: vec!["pi".to_string()],
+                    resume: None,
+                    required: true,
+                },
+                ApplicationSpec {
+                    role: PaneRole::Review,
+                    launch: vec!["tuicr".to_string()],
+                    resume: None,
+                    required: true,
+                },
+                ApplicationSpec {
+                    role: PaneRole::Terminal,
+                    launch: vec!["zsh".to_string()],
+                    resume: None,
+                    required: true,
+                },
+            ],
+        };
+        profile.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_layout_and_duplicate_modules() {
         let mut profile = LayoutProfile::default_agentic();
-        if let LayoutNode::Split { ratio, .. } = &mut profile.layout {
-            *ratio = 1.0;
-        }
+        profile.layout = "diagonal".to_string();
         assert!(profile.validate().is_err());
 
         let mut profile = LayoutProfile::default_agentic();
-        profile.applications[2].role = PaneRole::Agent;
+        profile.applications[1].role = PaneRole::Agent;
         assert!(profile.validate().is_err());
     }
 }

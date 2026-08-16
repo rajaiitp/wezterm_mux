@@ -237,16 +237,53 @@ fn restore_command(entry: &PaneEntry, config: &ConfigHandle) -> Option<CommandBu
     let Some(process) = entry.process.as_ref() else {
         return shell_command(config).map(CommandBuilder::from_argv);
     };
-    let command = if is_app(process, &["nvim", "vim", "vi", "neovim"]) {
-        editor_restore_command(process)
-    } else if is_app(process, &["pi"]) {
-        pi_restore_command(process, entry)
-    } else if is_app(process, &["claude", "codex", "tuxedo", "tuicr"]) {
-        recorded_restore_command(process)
+    let process = project_app_process(process);
+    let command = if is_app(&process, &["nvim", "vim", "vi", "neovim"]) {
+        editor_restore_command(&process)
+    } else if is_app(&process, &["pi"]) {
+        pi_restore_command(&process, entry)
+    } else if is_app(&process, &["claude", "codex", "tuxedo", "tuicr"]) {
+        recorded_restore_command(&process)
     } else {
         return shell_command(config).map(CommandBuilder::from_argv);
     };
-    Some(CommandBuilder::from_argv(command))
+    Some(CommandBuilder::from_argv(shell_backed_argv(command)))
+}
+
+fn project_app_process(process: &mux::tab::PaneProcessInfo) -> mux::tab::PaneProcessInfo {
+    let Some(marker) = process
+        .argv
+        .iter()
+        .position(|arg| arg == "wezterm-project-app")
+    else {
+        return process.clone();
+    };
+    let argv = process.argv.iter().skip(marker + 1).cloned().collect::<Vec<_>>();
+    let Some(executable) = argv.first() else {
+        return process.clone();
+    };
+    let name = Path::new(executable)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(executable)
+        .to_string();
+    mux::tab::PaneProcessInfo {
+        name,
+        executable: executable.clone(),
+        argv,
+        cwd: process.cwd.clone(),
+    }
+}
+
+fn shell_backed_argv(command: Vec<OsString>) -> Vec<OsString> {
+    let mut argv = vec![
+        OsString::from("/bin/sh"),
+        OsString::from("-lc"),
+        OsString::from(r#""$@"; exec "${SHELL:-/bin/sh}" -l"#),
+        OsString::from("wezterm-project-app"),
+    ];
+    argv.extend(command);
+    argv
 }
 
 fn recorded_restore_command(process: &mux::tab::PaneProcessInfo) -> Vec<OsString> {
@@ -385,7 +422,7 @@ fn latest_pi_session(entry: &PaneEntry, process: &mux::tab::PaneProcessInfo) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{editor_restore_command, recorded_restore_command};
+    use super::{editor_restore_command, project_app_process, recorded_restore_command};
     use mux::tab::PaneProcessInfo;
     use std::path::Path;
 
@@ -436,6 +473,24 @@ mod tests {
     fn falls_back_to_recorded_agent_executable() {
         let command = recorded_restore_command(&process("/usr/local/bin/claude", "", &[]));
         assert_eq!(command, ["/usr/local/bin/claude"]);
+    }
+
+    #[test]
+    fn extracts_the_application_from_a_shell_backed_project_pane() {
+        let restored = project_app_process(&process(
+            "/bin/sh",
+            "sh",
+            &[
+                "/bin/sh",
+                "-lc",
+                "\"$@\"; exec \"${SHELL:-/bin/sh}\" -l",
+                "wezterm-project-app",
+                "nvim",
+                "--clean",
+            ],
+        ));
+        assert_eq!(restored.name, "nvim");
+        assert_eq!(restored.argv, ["nvim", "--clean"]);
     }
 }
 

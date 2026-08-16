@@ -7207,6 +7207,7 @@ dependencies = [
  "clap",
  "codec",
  "config",
+ "dirs-next",
  "embed-resource",
  "env-bootstrap",
  "libc",

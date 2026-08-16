@@ -59,20 +59,6 @@ pub struct ProjectWorkspaceApplication {
 }
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
-pub struct ProjectWorkspaceLayoutNode {
-    #[dynamic(default)]
-    pub role: Option<String>,
-    #[dynamic(default)]
-    pub direction: Option<String>,
-    #[dynamic(default)]
-    pub ratio: Option<f32>,
-    #[dynamic(default)]
-    pub first: Option<Box<ProjectWorkspaceLayoutNode>>,
-    #[dynamic(default)]
-    pub second: Option<Box<ProjectWorkspaceLayoutNode>>,
-}
-
-#[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct ProjectWorkspaceConfig {
     /// Enable the native project/worktree picker.
     #[dynamic(default = "default_true")]
@@ -98,9 +84,10 @@ pub struct ProjectWorkspaceConfig {
     #[dynamic(default = "default_project_exclusions")]
     pub excluded_directories: Vec<String>,
 
-    /// Dotfile-defined pane topology and applications for new workspaces.
+    /// Named mux-owned layout for new project workspaces. Supported values:
+    /// single, columns, rows, three-pane, and grid.
     #[dynamic(default = "default_project_workspace_layout")]
-    pub layout: ProjectWorkspaceLayoutNode,
+    pub layout: String,
     #[dynamic(default = "default_project_workspace_applications")]
     pub applications: Vec<ProjectWorkspaceApplication>,
 }
@@ -131,26 +118,8 @@ fn default_project_exclusions() -> Vec<String> {
         .collect()
 }
 
-fn default_project_workspace_layout() -> ProjectWorkspaceLayoutNode {
-    ProjectWorkspaceLayoutNode {
-        role: None,
-        direction: Some("Horizontal".to_string()),
-        ratio: Some(0.5),
-        first: Some(Box::new(ProjectWorkspaceLayoutNode {
-            role: Some("agent".to_string()),
-            direction: None,
-            ratio: None,
-            first: None,
-            second: None,
-        })),
-        second: Some(Box::new(ProjectWorkspaceLayoutNode {
-            role: Some("editor".to_string()),
-            direction: None,
-            ratio: None,
-            first: None,
-            second: None,
-        })),
-    }
+fn default_project_workspace_layout() -> String {
+    "columns".to_string()
 }
 
 fn default_project_workspace_applications() -> Vec<ProjectWorkspaceApplication> {

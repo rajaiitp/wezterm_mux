@@ -7,7 +7,9 @@ use crate::window::{Window, WindowId};
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
-use domain::{Domain, DomainId, DomainState, SplitSource};
+use domain::{
+    Domain, DomainId, DomainState, ProjectLayoutRequest, SplitSource,
+};
 use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 #[cfg(unix)]
 use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
@@ -1226,6 +1228,34 @@ impl Mux {
         window.get_active().map(Arc::clone)
     }
 
+    /// Resolve a safe initial geometry for mux-owned workspace provisioning.
+    /// Project callers may pass `TerminalSize::default()`; zero-sized tabs are
+    /// never sent to a domain or used to compute a split.
+    pub fn project_spawn_size(&self, requested: TerminalSize, workspace: &str) -> TerminalSize {
+        if requested.cols > 0 && requested.rows > 0 {
+            return requested;
+        }
+
+        if let Some(size) = self
+            .windows
+            .read()
+            .values()
+            .filter(|window| window.get_workspace() == workspace)
+            .filter_map(|window| window.get_active().map(|tab| tab.get_size()))
+            .find(|size| size.cols > 0 && size.rows > 0)
+        {
+            return size;
+        }
+
+        TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        }
+    }
+
     pub fn new_empty_window(
         &self,
         workspace: Option<String>,
@@ -1432,6 +1462,20 @@ impl Mux {
                 _ => None,
             }
         })
+    }
+
+    pub async fn spawn_project_layout(
+        &self,
+        domain: SpawnTabDomain,
+        request: ProjectLayoutRequest,
+    ) -> anyhow::Result<()> {
+        let domain = self
+            .resolve_spawn_tab_domain(None, &domain)
+            .context("resolve project workspace domain")?;
+        if domain.state() == DomainState::Detached {
+            domain.attach(None).await?;
+        }
+        domain.spawn_project_layout(request).await
     }
 
     pub async fn split_pane(

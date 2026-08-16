@@ -3,7 +3,7 @@ use anyhow::{anyhow, Context};
 use codec::*;
 use config::TermConfig;
 use mux::client::ClientId;
-use mux::domain::SplitSource;
+use mux::domain::{ProjectLayoutRequest, ProjectPaneSpec, SplitSource};
 use mux::pane::{CachePolicy, Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
@@ -750,6 +750,14 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::SpawnProject(spawn) => {
+                let client_id = self.client_id.clone();
+                spawn_into_main_thread(async move {
+                    schedule_project_spawn(spawn, send_response, client_id);
+                })
+                .detach();
+            }
+
             Pdu::SplitPane(split) => {
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
@@ -1138,6 +1146,58 @@ async fn split_pane(split: SplitPane, client_id: Option<Arc<ClientId>>) -> anyho
         window_id,
         size,
     }))
+}
+
+fn schedule_project_spawn<SND>(
+    spawn: SpawnProject,
+    send_response: SND,
+    client_id: Option<Arc<ClientId>>,
+) where
+    SND: Fn(anyhow::Result<Pdu>) + 'static,
+{
+    promise::spawn::spawn(async move { send_response(project_spawn(spawn, client_id).await) })
+        .detach();
+}
+
+async fn project_spawn(spawn: SpawnProject, client_id: Option<Arc<ClientId>>) -> anyhow::Result<Pdu> {
+    let mux = Mux::get();
+    let _identity = mux.with_identity(client_id.clone());
+    let client_id = client_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("client identity is not registered"))?;
+    anyhow::ensure!(!spawn.workspace.is_empty(), "project workspace is empty");
+    anyhow::ensure!(!spawn.panes.is_empty(), "project workspace has no panes");
+
+    if spawn.create_workspace {
+        mux.create_workspace_for_client(client_id, &spawn.workspace)?;
+    }
+
+    let request = ProjectLayoutRequest {
+        workspace: spawn.workspace.clone(),
+        size: spawn.size,
+        layout: spawn.layout,
+        panes: spawn
+            .panes
+            .into_iter()
+            .map(|pane| ProjectPaneSpec {
+                command: pane.command,
+                command_dir: pane.command_dir,
+            })
+            .collect(),
+    };
+    let result = mux
+        .spawn_project_layout(config::keyassignment::SpawnTabDomain::DefaultDomain, request)
+        .await;
+    if let Err(error) = result {
+        if spawn.create_workspace {
+            mux.restore_previous_workspace_for_client(client_id);
+        }
+        return Err(error);
+    }
+    if spawn.create_workspace {
+        mux.claim_workspace_for_client(client_id, &spawn.workspace)?;
+    }
+    Ok(Pdu::UnitResponse(UnitResponse {}))
 }
 
 async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> anyhow::Result<Pdu> {

@@ -2,11 +2,13 @@ use crate::client::Client;
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
-use codec::{ListPanesResponse, SpawnV2, SplitPane};
+use codec::{ListPanesResponse, SpawnProject, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::connui::{ConnectionUI, ConnectionUIParams};
-use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
+use mux::domain::{
+    alloc_domain_id, Domain, DomainId, DomainState, ProjectLayoutRequest, SplitSource,
+};
 use mux::pane::{Pane, PaneId};
 use mux::tab::{SplitRequest, Tab, TabId};
 use mux::window::WindowId;
@@ -1029,6 +1031,34 @@ impl Domain for ClientDomain {
         mux.add_tab_to_window(&tab, window)?;
 
         Ok(tab)
+    }
+
+    async fn spawn_project_layout(&self, request: ProjectLayoutRequest) -> anyhow::Result<()> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        inner
+            .client
+            .spawn_project(SpawnProject {
+                workspace: request.workspace,
+                size: request.size,
+                layout: request.layout,
+                panes: request
+                    .panes
+                    .into_iter()
+                    .map(|pane| codec::SpawnProjectPane {
+                        command: pane.command,
+                        command_dir: pane.command_dir,
+                    })
+                    .collect(),
+                create_workspace: true,
+            })
+            .await?;
+
+        // The server performed the complete topology transaction. Refresh the
+        // local mirror once after the response instead of racing one resync per
+        // intermediate spawn/split notification.
+        self.resync().await
     }
 
     async fn split_pane(

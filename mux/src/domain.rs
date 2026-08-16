@@ -7,7 +7,7 @@
 
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, Pane, PaneId};
-use crate::tab::{SplitRequest, Tab, TabId};
+use crate::tab::{ProjectLayout, SplitRequest, Tab, TabId};
 use crate::window::WindowId;
 use crate::Mux;
 use anyhow::{bail, Context, Error};
@@ -23,6 +23,20 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wezterm_term::TerminalSize;
+
+#[derive(Debug, Clone)]
+pub struct ProjectPaneSpec {
+    pub command: Option<CommandBuilder>,
+    pub command_dir: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectLayoutRequest {
+    pub workspace: String,
+    pub size: TerminalSize,
+    pub layout: ProjectLayout,
+    pub panes: Vec<ProjectPaneSpec>,
+}
 
 static DOMAIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type DomainId = usize;
@@ -69,6 +83,48 @@ pub trait Domain: Downcast + Send + Sync {
         mux.add_tab_to_window(&tab, window)?;
 
         Ok(tab)
+    }
+
+    /// Provision a complete project workspace in the mux. Remote domains
+    /// override this with one RPC so GUI code never races individual split and
+    /// resize notifications.
+    async fn spawn_project_layout(&self, request: ProjectLayoutRequest) -> anyhow::Result<()> {
+        anyhow::ensure!(!request.workspace.is_empty(), "project workspace is empty");
+        anyhow::ensure!(!request.panes.is_empty(), "project workspace has no panes");
+        anyhow::ensure!(request.panes.len() <= 4, "project workspace has too many panes");
+
+        let mux = Mux::get();
+        let size = mux.project_spawn_size(request.size, &request.workspace);
+        let window = mux.new_empty_window(Some(request.workspace), None);
+        let window_id = *window;
+        let total = request.panes.len();
+        let layout = request.layout;
+        let first = request.panes[0].clone();
+        let tab = self
+            .spawn(size, first.command, first.command_dir, window_id)
+            .await?;
+
+        for (step, pane) in request.panes.into_iter().enumerate().skip(1) {
+            let (source_index, split_request) = tab
+                .project_layout_split(layout, step, total)
+                .ok_or_else(|| anyhow::anyhow!("layout cannot place project pane {step}"))?;
+            let source = tab
+                .iter_panes()
+                .into_iter()
+                .nth(source_index)
+                .ok_or_else(|| anyhow::anyhow!("layout source pane {source_index} is missing"))?;
+            self.split_pane(
+                SplitSource::Spawn {
+                    command: pane.command,
+                    command_dir: pane.command_dir,
+                },
+                tab.tab_id(),
+                source.pane.pane_id(),
+                split_request,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn split_pane(
