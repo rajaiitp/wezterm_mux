@@ -430,6 +430,50 @@ impl TabBarState {
         left_status: &str,
         right_status: &str,
     ) -> Self {
+        Self::new_with_options(
+            title_width,
+            mouse_x,
+            tab_info,
+            pane_info,
+            colors,
+            config,
+            left_status,
+            right_status,
+            true,
+        )
+    }
+
+    pub fn new_workspace_bar(
+        title_width: usize,
+        mouse_x: Option<usize>,
+        colors: Option<&TabBarColors>,
+        config: &ConfigHandle,
+        left_status: &str,
+    ) -> Self {
+        Self::new_with_options(
+            title_width,
+            mouse_x,
+            &[],
+            &[],
+            colors,
+            config,
+            left_status,
+            "",
+            false,
+        )
+    }
+
+    fn new_with_options(
+        title_width: usize,
+        mouse_x: Option<usize>,
+        tab_info: &[TabInformation],
+        pane_info: &[PaneInformation],
+        colors: Option<&TabBarColors>,
+        config: &ConfigHandle,
+        left_status: &str,
+        right_status: &str,
+        show_new_tab_button: bool,
+    ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
 
         let active_cell_attrs = colors.active_tab().as_cell_attributes();
@@ -497,7 +541,7 @@ impl TabBarState {
         let right_status_width = parse_status_text(right_status, CellAttributes::default())
             .len()
             .min(title_width);
-        let new_tab_width = if config.show_new_tab_button_in_tab_bar {
+        let new_tab_width = if show_new_tab_button && config.show_new_tab_button_in_tab_bar {
             new_tab.len()
         } else {
             0
@@ -617,7 +661,7 @@ impl TabBarState {
         }
 
         // New tab button
-        if config.show_new_tab_button_in_tab_bar {
+        if show_new_tab_button && config.show_new_tab_button_in_tab_bar {
             let hover = is_tab_hover(mouse_x, x, new_tab_hover.len());
 
             let new_tab_button = if hover { &new_tab_hover } else { &new_tab };

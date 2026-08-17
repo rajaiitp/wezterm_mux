@@ -524,7 +524,11 @@ impl GuiFrontEnd {
         true
     }
 
-    pub fn workspace_status(&self, window_id: MuxWindowId, active: &str) -> (String, Vec<String>) {
+    pub fn workspace_status(
+        &self,
+        window_id: MuxWindowId,
+        active: &str,
+    ) -> (String, Vec<(String, usize)>) {
         let workspace = Mux::get()
             .get_window(window_id)
             .map(|window| window.get_workspace().to_string())

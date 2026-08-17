@@ -15,6 +15,22 @@ pub const DEFAULT_WORKSPACE: &str = "default";
 pub const WORKSPACE_PICKER_EVENT: &str = "__wezterm_workspace_picker";
 pub const WORKSPACE_DELETE_EVENT: &str = "__wezterm_workspace_delete";
 
+fn compact_project_branch_label(label: &str) -> String {
+    let label = label.trim();
+    let Some((project, branch)) = label.split_once(" : ") else {
+        return label.to_string();
+    };
+
+    let project = project.trim();
+    let branch = branch.trim();
+    let branch_as_folder = branch.replace('/', "-").replace('\\', "-");
+    if project.eq_ignore_ascii_case(branch) || project.eq_ignore_ascii_case(&branch_as_folder) {
+        project.to_string()
+    } else {
+        label.to_string()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 struct LastTab {
     #[serde(default)]
@@ -215,35 +231,67 @@ impl WorkspaceManager {
         }
     }
 
-    pub fn status(&mut self, active: &str) -> (String, Vec<String>) {
+    pub fn status(&mut self, active: &str) -> (String, Vec<(String, usize)>) {
         let active = if active.is_empty() {
             DEFAULT_WORKSPACE
         } else {
             active
         };
-        let display_name = self.display_name(active).to_uppercase();
-        let names = vec![active.to_string()];
-        log::trace!(
-            "workspace manager active={} display_name={} ordered={:?} previous={:?}",
-            active,
-            display_name,
-            self.display_names(),
-            self.previous,
+
+        self.sync_order();
+        let live: HashSet<String> = Mux::get().iter_workspaces().into_iter().collect();
+        let mut names = vec![DEFAULT_WORKSPACE.to_string()];
+        names.extend(
+            self.order
+                .iter()
+                .filter(|name| live.contains(name.as_str()))
+                .cloned(),
         );
-        let items = vec![
-            FormatItem::Background(FormatColor::Color("#1d2021".to_string())),
-            FormatItem::Text(" ".to_string()),
-            FormatItem::Background(FormatColor::Color("#83a598".to_string())),
-            FormatItem::Foreground(FormatColor::Color("#1d2021".to_string())),
-            FormatItem::Attribute(AttributeChange::Intensity(Intensity::Bold)),
-            FormatItem::Text(format!("  {display_name}  ")),
-            FormatItem::Attribute(AttributeChange::Intensity(Intensity::Normal)),
+        if active != DEFAULT_WORKSPACE && !names.iter().any(|name| name == active) {
+            names.push(active.to_string());
+        }
+
+        let mut items = vec![
             FormatItem::Background(FormatColor::Color("#1d2021".to_string())),
             FormatItem::Text(" ".to_string()),
         ];
+        let mut targets = Vec::with_capacity(names.len());
+        for workspace in names {
+            let display_name = self.display_name(&workspace);
+            let segment = format!("  {display_name}  ");
+            let width = wezterm_term::unicode_column_width(&segment, None);
+            let is_active = workspace == active;
+            let background = if is_active { "#83a598" } else { "#504945" };
+            let foreground = if is_active { "#1d2021" } else { "#ebdbb2" };
+            items.push(FormatItem::Background(FormatColor::Color(
+                background.to_string(),
+            )));
+            items.push(FormatItem::Foreground(FormatColor::Color(
+                foreground.to_string(),
+            )));
+            items.push(FormatItem::Attribute(AttributeChange::Intensity(
+                if is_active {
+                    Intensity::Bold
+                } else {
+                    Intensity::Normal
+                },
+            )));
+            items.push(FormatItem::Text(segment));
+            items.push(FormatItem::Background(FormatColor::Color(
+                "#1d2021".to_string(),
+            )));
+            items.push(FormatItem::Text(" ".to_string()));
+            targets.push((workspace, width));
+        }
 
         let status = format_as_escapes(items).unwrap_or_default();
-        (status, names)
+        log::trace!(
+            "workspace manager active={} workspaces={:?} previous={:?}",
+            active,
+            targets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            self.previous,
+        );
+        (status, targets)
     }
 
     fn display_name(&mut self, active: &str) -> String {
@@ -261,7 +309,7 @@ impl WorkspaceManager {
         label
             .map(|workspace| workspace.label.trim())
             .filter(|label| !label.is_empty())
-            .map(ToOwned::to_owned)
+            .map(compact_project_branch_label)
             .unwrap_or_else(|| active.to_string())
     }
 

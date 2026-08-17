@@ -344,7 +344,7 @@ impl UnixStreamExt for UnixStream {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
     let mut credentials = libc::ucred {
         pid: 0,
@@ -362,6 +362,19 @@ fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
         )
     };
     (result == 0).then_some(credentials.uid)
+}
+
+#[cfg(target_os = "macos")]
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    let mut uid = 0;
+    let mut gid = 0;
+    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    (result == 0).then_some(uid)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn peer_uid(_stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    None
 }
 
 #[cfg(unix)]

@@ -1,4 +1,5 @@
 use crate::quad::TripleLayerQuadAllocator;
+use crate::tabbar::TabBarState;
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
@@ -26,19 +27,44 @@ impl crate::TermWindow {
         }
 
         let border = self.get_os_border();
-
-        let palette = self.palette().clone();
         let tab_bar_height = self.tab_bar_pixel_height()?;
+        let workspace_bar_height = self.workspace_bar_pixel_height()?;
         let tab_bar_y = if self.config.tab_bar_at_bottom {
-            ((self.dimensions.pixel_height as f32) - (tab_bar_height + border.bottom.get() as f32))
+            ((self.dimensions.pixel_height as f32)
+                - (tab_bar_height + workspace_bar_height + border.bottom.get() as f32))
                 .max(0.)
         } else {
             border.top.get() as f32
         };
+        let tab_bar = self.tab_bar.clone();
+        self.paint_tab_bar_line(layers, &tab_bar, tab_bar_y)
+    }
 
-        // Register the tab bar location
-        self.ui_items.append(&mut self.tab_bar.compute_ui_items(
-            tab_bar_y as usize,
+    pub fn paint_workspace_bar(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        if !self.show_tab_bar {
+            return Ok(());
+        }
+        let border = self.get_os_border();
+        let workspace_bar_height = self.workspace_bar_pixel_height()?;
+        let workspace_bar_y = ((self.dimensions.pixel_height as f32)
+            - (workspace_bar_height + border.bottom.get() as f32))
+            .max(0.);
+        let workspace_bar = self.workspace_bar.clone();
+        self.paint_tab_bar_line(layers, &workspace_bar, workspace_bar_y)
+    }
+
+    fn paint_tab_bar_line(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        state: &TabBarState,
+        top_pixel_y: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette().clone();
+        self.ui_items.append(&mut state.compute_ui_items(
+            top_pixel_y as usize,
             self.render_metrics.cell_size.height as usize,
             self.render_metrics.cell_size.width as usize,
         ));
@@ -56,14 +82,15 @@ impl crate::TermWindow {
             } else {
                 self.config.text_background_opacity
             });
+        let line = state.line().clone();
 
         self.render_screen_line(
             RenderScreenLineParams {
-                top_pixel_y: tab_bar_y,
+                top_pixel_y,
                 left_pixel_x: 0.,
                 pixel_width: self.dimensions.pixel_width as f32,
                 stable_line_idx: None,
-                line: self.tab_bar.line(),
+                line: &line,
                 selection: 0..0,
                 cursor: &Default::default(),
                 palette: &palette,
@@ -122,5 +149,21 @@ impl crate::TermWindow {
 
     pub fn tab_bar_pixel_height(&self) -> anyhow::Result<f32> {
         Self::tab_bar_pixel_height_impl(&self.config, &self.fonts, &self.render_metrics)
+    }
+
+    pub fn workspace_bar_pixel_height(&self) -> anyhow::Result<f32> {
+        if self.show_tab_bar {
+            self.tab_bar_pixel_height()
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    pub fn total_bar_pixel_height(&self) -> anyhow::Result<f32> {
+        if self.show_tab_bar {
+            Ok(self.tab_bar_pixel_height()? * 2.0)
+        } else {
+            Ok(0.0)
+        }
     }
 }

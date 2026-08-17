@@ -58,10 +58,11 @@ impl crate::TermWindow {
         } else {
             0.
         };
+        let workspace_bar_height = self.workspace_bar_pixel_height()?;
         let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
+            (0.0, tab_bar_height + workspace_bar_height)
         } else {
-            (tab_bar_height, 0.0)
+            (tab_bar_height, workspace_bar_height)
         };
         let (padding_left, padding_top, padding_right, padding_bottom) =
             self.padding_left_top_right_bottom();
@@ -200,10 +201,11 @@ impl crate::TermWindow {
         } else {
             0.
         };
+        let workspace_bar_height = self.workspace_bar_pixel_height()?;
         let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
+            (0.0, tab_bar_height + workspace_bar_height)
         } else {
-            (tab_bar_height, 0.0)
+            (tab_bar_height, workspace_bar_height)
         };
 
         let border = self.get_os_border();
@@ -767,10 +769,11 @@ impl crate::TermWindow {
         } else {
             0.
         };
+        let workspace_bar_height = self.workspace_bar_pixel_height()?;
         let (top_bar_height, _bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
+            (0.0, tab_bar_height + workspace_bar_height)
         } else {
-            (tab_bar_height, 0.0)
+            (tab_bar_height, workspace_bar_height)
         };
 
         let border = self.get_os_border();

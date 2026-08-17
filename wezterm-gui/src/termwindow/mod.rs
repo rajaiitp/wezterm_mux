@@ -454,6 +454,7 @@ pub struct TermWindow {
     show_tab_bar: bool,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
+    workspace_bar: TabBarState,
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
@@ -714,7 +715,7 @@ impl TermWindow {
         // for the tab bar state.
         let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
         let tab_bar_height = if show_tab_bar {
-            Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)? as usize
+            (Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)? * 2.0) as usize
         } else {
             0
         };
@@ -838,6 +839,7 @@ impl TermWindow {
             show_tab_bar,
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
+            workspace_bar: TabBarState::default(),
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -1301,10 +1303,7 @@ impl TermWindow {
                     tx.try_send(result).ok();
                 }
             }
-            TermWindowNotif::DeleteWorkspace {
-                pane_id,
-                workspace,
-            } => {
+            TermWindowNotif::DeleteWorkspace { pane_id, workspace } => {
                 self.cancel_overlay_for_pane(pane_id);
                 crate::overlay::selector::trampoline(
                     crate::workspace::WORKSPACE_DELETE_EVENT.to_string(),
@@ -1832,7 +1831,7 @@ impl TermWindow {
         }
     }
 
-    fn set_native_workspace_click_targets(&mut self, workspaces: &[String], status: &str) {
+    fn set_native_workspace_click_targets(&mut self, workspaces: &[(String, usize)], status: &str) {
         self.right_status_click_targets.clear();
         if workspaces.len() == 1 {
             // The native status contains one spacer cell on either side of the
@@ -1843,9 +1842,15 @@ impl TermWindow {
                     .len();
             let pill_width = status_width.saturating_sub(2);
             self.right_status_click_targets
-                .push((workspaces[0].clone(), 1, 1 + pill_width));
+                .push((workspaces[0].0.clone(), 1, 1 + pill_width));
         } else {
-            self.set_right_status_click_targets(workspaces);
+            let mut offset = 1;
+            for (workspace, width) in workspaces {
+                let end = offset + *width + 1;
+                self.right_status_click_targets
+                    .push((workspace.clone(), offset, end));
+                offset = end;
+            }
         }
     }
 
@@ -2302,19 +2307,30 @@ impl TermWindow {
 
         let border = self.get_os_border();
         let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+        let workspace_bar_height = self.workspace_bar_pixel_height().unwrap_or(0.);
         let tab_bar_y = if self.config.tab_bar_at_bottom {
-            ((self.dimensions.pixel_height as f32) - (tab_bar_height + border.bottom.get() as f32))
+            ((self.dimensions.pixel_height as f32)
+                - (tab_bar_height + workspace_bar_height + border.bottom.get() as f32))
                 .max(0.)
         } else {
             border.top.get() as f32
         };
-
-        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+        let workspace_bar_y = ((self.dimensions.pixel_height as f32)
+            - (workspace_bar_height + border.bottom.get() as f32))
+            .max(0.);
 
         let hovering_in_tab_bar = match &self.current_mouse_event {
             Some(event) => {
                 let mouse_y = event.coords.y as f32;
                 mouse_y >= tab_bar_y as f32 && mouse_y < tab_bar_y as f32 + tab_bar_height
+            }
+            None => false,
+        };
+        let hovering_in_workspace_bar = match &self.current_mouse_event {
+            Some(event) => {
+                let mouse_y = event.coords.y as f32;
+                mouse_y >= workspace_bar_y as f32
+                    && mouse_y < workspace_bar_y as f32 + workspace_bar_height
             }
             None => false,
         };
@@ -2337,11 +2353,9 @@ impl TermWindow {
             native_workspace_status.len(),
         );
 
-        // Keep the active project/worktree label at the left edge and leave
-        // the right edge available for user-provided status text.
-        let mut tab_left_status = native_workspace_status;
-        tab_left_status.push_str(&self.left_status);
-
+        // Keep the existing application tabs in the top bar. The workspace
+        // names are rendered separately in the bottom workspace bar.
+        let tab_left_status = self.left_status.clone();
         let new_tab_bar = TabBarState::new(
             self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
             if hovering_in_tab_bar {
@@ -2356,8 +2370,20 @@ impl TermWindow {
             &tab_left_status,
             &self.right_status,
         );
-        if new_tab_bar != self.tab_bar {
+        let new_workspace_bar = TabBarState::new_workspace_bar(
+            self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
+            if hovering_in_workspace_bar {
+                Some(self.last_mouse_coords.0)
+            } else {
+                None
+            },
+            self.config.resolved_palette.tab_bar.as_ref(),
+            &self.config,
+            &native_workspace_status,
+        );
+        if new_tab_bar != self.tab_bar || new_workspace_bar != self.workspace_bar {
             self.tab_bar = new_tab_bar;
+            self.workspace_bar = new_workspace_bar;
             self.invalidate_fancy_tab_bar();
             self.invalidate_modal();
         }
@@ -4117,9 +4143,7 @@ impl TermWindow {
                 self.terminal_size
             );
         }
-        if tab_size.rows != self.terminal_size.rows
-            || tab_size.cols != self.terminal_size.cols
-        {
+        if tab_size.rows != self.terminal_size.rows || tab_size.cols != self.terminal_size.cols {
             // A split can be created while the tab root still has bootstrap
             // dimensions even though its existing leaf fills the GUI. Update
             // the root with the compositor size before the next split.

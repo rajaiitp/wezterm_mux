@@ -392,11 +392,7 @@ impl crate::TermWindow {
             - self.terminal_size.pixel_height as f32
             - padding_top
             - padding_bottom
-            - if self.show_tab_bar {
-                self.tab_bar_pixel_height().unwrap_or(0.)
-            } else {
-                0.
-            };
+            - self.total_bar_pixel_height().unwrap_or(0.);
         let left_gap = match self.config.window_content_alignment.horizontal {
             HorizontalWindowContentAlignment::Left => 0.,
             HorizontalWindowContentAlignment::Center => (horizontal_gap / 2.).round(),
@@ -450,11 +446,7 @@ impl crate::TermWindow {
             - self.terminal_size.pixel_height as f32
             - base_top
             - base_bottom
-            - if self.show_tab_bar {
-                self.tab_bar_pixel_height().unwrap_or(0.)
-            } else {
-                0.
-            };
+            - self.total_bar_pixel_height().unwrap_or(0.);
         let right_gap = horizontal_gap - (padding_left - base_left);
         let bottom_gap = vertical_gap - (padding_top - base_top);
         (

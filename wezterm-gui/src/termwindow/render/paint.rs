@@ -261,6 +261,7 @@ impl crate::TermWindow {
                 } else {
                     0.
                 };
+                let total_bar_height = self.total_bar_pixel_height()?;
                 let terminal_top = if self.config.tab_bar_at_bottom {
                     0.
                 } else {
@@ -273,7 +274,7 @@ impl crate::TermWindow {
                         0.,
                         terminal_top,
                         self.dimensions.pixel_width as f32,
-                        self.dimensions.pixel_height as f32 - tab_bar_height,
+                        self.dimensions.pixel_height as f32 - total_bar_height,
                     ),
                     window::color::LinearRgba::with_components(0., 0., 0., 0.48),
                 )
@@ -360,6 +361,8 @@ impl crate::TermWindow {
 
         if self.show_tab_bar {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
+            self.paint_workspace_bar(&mut layers)
+                .context("paint_workspace_bar")?;
         }
 
         self.paint_window_borders(&mut layers)
