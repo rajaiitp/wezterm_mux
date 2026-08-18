@@ -85,7 +85,7 @@ pub struct ProjectWorkspaceConfig {
     pub excluded_directories: Vec<String>,
 
     /// Named mux-owned layout for new project workspaces. Supported values:
-    /// single, columns, rows, three-pane, and grid.
+    /// single, tabs, columns, rows, three-pane, and grid.
     #[dynamic(default = "default_project_workspace_layout")]
     pub layout: String,
     #[dynamic(default = "default_project_workspace_applications")]

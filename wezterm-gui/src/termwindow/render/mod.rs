@@ -68,6 +68,11 @@ pub struct LineQuadCacheKey {
     pub left_pixel_x: NotNan<f32>,
     pub phys_line_idx: usize,
     pub pane_id: PaneId,
+    /// Cached line quads depend on the pane viewport geometry. Without these
+    /// dimensions, a split can reuse full-width/full-height quads until a tab
+    /// round-trip happens to rebuild the cache.
+    pub pane_cols: usize,
+    pub pane_rows: usize,
     pub pane_is_active: bool,
     /// A cursor position with the y value fixed at 0.
     /// Only is_some() if the y value matches this row.

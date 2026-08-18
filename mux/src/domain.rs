@@ -99,6 +99,17 @@ pub trait Domain: Downcast + Send + Sync {
         let window_id = *window;
         let total = request.panes.len();
         let layout = request.layout;
+
+        if layout == ProjectLayout::Tabs {
+            // Window::push keeps the first tab active, so callers control the
+            // initial focus by ordering their application modules.
+            for pane in request.panes {
+                self.spawn(size, pane.command, pane.command_dir, window_id)
+                    .await?;
+            }
+            return Ok(());
+        }
+
         let first = request.panes[0].clone();
         let tab = self
             .spawn(size, first.command, first.command_dir, window_id)

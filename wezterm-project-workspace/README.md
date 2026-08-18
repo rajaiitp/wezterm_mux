@@ -10,12 +10,13 @@ The crate provides:
 - stable domain-aware project/workspace IDs;
 - central managed-worktree path generation and containment checks;
 - validated new-branch and existing-branch worktree plans;
-- role-based module profiles with named `single`, `columns`, `rows`,
+- role-based module profiles with named `single`, `tabs`, `columns`, `rows`,
   `three-pane`, and `grid` layouts; and
 - a versioned, atomic, private workspace registry.
 
 It intentionally contains no GUI or mux code. `wezterm-gui` owns native modal
 interaction and submits module commands plus the named layout to the mux. The
-mux owns all split sizing and pane geometry. The provided dotfile configuration
-opens `pi --continue` and `nvim .` in the `columns` layout; tuicr is available
-as a separate app toggle unless explicitly configured as a module.
+mux owns all tab creation, split sizing, and pane geometry. The provided dotfile
+configuration opens `pi --continue` and `nvim .` in separate tabs using the
+`tabs` layout; tuicr is available as a separate app toggle unless explicitly
+configured as a module.

@@ -98,11 +98,12 @@ pub enum SplitDirection {
     Vertical,
 }
 
-/// Fixed project topologies. The mux computes all split cell sizes from the
-/// tab geometry; callers only select the topology and provide pane commands.
+/// Fixed project topologies. The mux owns tab and split provisioning; callers
+/// only select the topology and provide application commands.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProjectLayout {
     Single,
+    Tabs,
     Columns,
     Rows,
     ThreePane,
@@ -115,6 +116,7 @@ impl std::str::FromStr for ProjectLayout {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "single" => Ok(Self::Single),
+            "tabs" | "tab" => Ok(Self::Tabs),
             "columns" | "column" => Ok(Self::Columns),
             "rows" | "row" => Ok(Self::Rows),
             "three-pane" | "three_pane" | "three" => Ok(Self::ThreePane),
@@ -749,7 +751,7 @@ impl Tab {
         };
 
         match layout {
-            ProjectLayout::Single => None,
+            ProjectLayout::Single | ProjectLayout::Tabs => None,
             ProjectLayout::Columns => split(SplitDirection::Horizontal, 0, equal_columns()),
             ProjectLayout::Rows => split(SplitDirection::Vertical, 0, equal_rows()),
             ProjectLayout::ThreePane => match step {
@@ -3035,6 +3037,8 @@ mod test {
         assert_eq!(grid.direction, SplitDirection::Vertical);
         assert_eq!(grid.size, SplitSize::Percent(50));
         assert!(tab.project_layout_split(ProjectLayout::Single, 1, 2).is_none());
+        assert!(tab.project_layout_split(ProjectLayout::Tabs, 1, 2).is_none());
+        assert_eq!("tabs".parse::<ProjectLayout>(), Ok(ProjectLayout::Tabs));
     }
 
     #[test]

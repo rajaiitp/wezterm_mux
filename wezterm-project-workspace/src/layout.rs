@@ -64,7 +64,10 @@ impl LayoutProfile {
     pub fn validate(&self) -> anyhow::Result<()> {
         let layout = self.layout.trim().to_ascii_lowercase();
         anyhow::ensure!(
-            matches!(layout.as_str(), "single" | "columns" | "rows" | "three-pane" | "grid"),
+            matches!(
+                layout.as_str(),
+                "single" | "tabs" | "columns" | "rows" | "three-pane" | "grid"
+            ),
             "unknown project layout {layout:?}"
         );
         anyhow::ensure!(!self.applications.is_empty(), "project layout has no modules");
@@ -149,6 +152,11 @@ mod tests {
             ],
         };
         profile.validate().unwrap();
+
+        let mut tabs = profile.clone();
+        tabs.name = "tabs".to_string();
+        tabs.layout = "tabs".to_string();
+        tabs.validate().unwrap();
     }
 
     #[test]

@@ -589,6 +589,8 @@ impl crate::TermWindow {
 
                     let quad_key = LineQuadCacheKey {
                         pane_id: self.pane_id,
+                        pane_cols: self.dims.cols,
+                        pane_rows: self.dims.viewport_rows,
                         password_input,
                         pane_is_active: self.pos.is_active,
                         config_generation: self.term_window.config.generation(),

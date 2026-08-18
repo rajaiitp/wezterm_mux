@@ -115,30 +115,17 @@ pub(crate) fn select_project(
         log::warn!("unable to list Git worktrees for {}", path.display());
         return;
     };
-    let mut choices = vec![
-        InputSelectorEntry {
-            label: "Create new branch + worktree…".to_string(),
-            id: Some(format!(
-                "{NEW_BRANCH_ENTRY_PREFIX}{}",
-                path.to_string_lossy()
-            )),
-        },
-        InputSelectorEntry {
-            label: "Attach existing local branch…".to_string(),
-            id: Some(format!(
-                "{EXISTING_BRANCH_ENTRY_PREFIX}{}",
-                path.to_string_lossy()
-            )),
-        },
-    ];
-    choices.extend(worktrees.into_iter().map(|worktree| InputSelectorEntry {
-        label: format!(
-            "{}  {}",
-            worktree.branch.as_deref().unwrap_or("detached"),
-            worktree.path.display()
-        ),
-        id: Some(worktree.path.to_string_lossy().into_owned()),
-    }));
+    let choices = worktrees
+        .into_iter()
+        .map(|worktree| InputSelectorEntry {
+            label: format!(
+                "{}  {}",
+                worktree.branch.as_deref().unwrap_or("detached"),
+                worktree.path.display()
+            ),
+            id: Some(worktree.path.to_string_lossy().into_owned()),
+        })
+        .collect();
     term_window.show_input_selector(&InputSelector {
         action: Box::new(KeyAssignment::EmitEvent(WORKTREE_EVENT.to_string())),
         title: "Choose worktree".to_string(),

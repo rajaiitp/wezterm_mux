@@ -240,13 +240,14 @@ impl WorkspaceManager {
 
         self.sync_order();
         let live: HashSet<String> = Mux::get().iter_workspaces().into_iter().collect();
-        let mut names = vec![DEFAULT_WORKSPACE.to_string()];
-        names.extend(
-            self.order
-                .iter()
-                .filter(|name| live.contains(name.as_str()))
-                .cloned(),
-        );
+        // The default workspace is a hidden scratchpad. Do not include it in
+        // the workspace bar shown below the application tabs.
+        let mut names: Vec<String> = self
+            .order
+            .iter()
+            .filter(|name| live.contains(name.as_str()))
+            .cloned()
+            .collect();
         if active != DEFAULT_WORKSPACE && !names.iter().any(|name| name == active) {
             names.push(active.to_string());
         }

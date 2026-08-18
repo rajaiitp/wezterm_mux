@@ -1522,6 +1522,11 @@ impl TermWindow {
                     // their full split rectangles. Restore the configured
                     // content padding immediately after the layout sync.
                     self.reconcile_pane_content_sizes();
+                    // Line quads include terminal glyphs and backgrounds. A
+                    // split changes their clipping rectangle even when the
+                    // text itself is unchanged, so force a geometry repaint.
+                    self.quad_generation += 1;
+                    window.invalidate();
                     // Also handled by wezterm-client
                     self.update_title_post_status();
                 }
@@ -1544,6 +1549,7 @@ impl TermWindow {
                     // redraw immediately rather than waiting for tab focus.
                     self.sync_active_tab_size();
                     self.reconcile_pane_content_sizes();
+                    self.quad_generation += 1;
                     self.update_title_post_status();
                     window.invalidate();
                 }
