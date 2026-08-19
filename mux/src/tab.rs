@@ -103,6 +103,8 @@ pub enum SplitDirection {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProjectLayout {
     Single,
+    /// Put the first two applications in a left/right tab and each remaining
+    /// application in its own additional tab.
     Tabs,
     Columns,
     Rows,
@@ -1351,8 +1353,8 @@ impl TabInner {
             // A pane resize or close can leave a nested node one cell larger
             // than its parent. Repair that stale geometry even when the tab
             // itself already matches the GUI dimensions.
-            layout_changed = previous_size != size
-                || normalize_layout_tree(self.pane.as_mut().unwrap(), size);
+            layout_changed =
+                previous_size != size || normalize_layout_tree(self.pane.as_mut().unwrap(), size);
         }
 
         if layout_changed {
@@ -3023,21 +3025,21 @@ mod test {
         assert_eq!(columns.direction, SplitDirection::Horizontal);
         assert_eq!(columns.size, SplitSize::Cells(40));
 
-        let (source, rows) = tab
-            .project_layout_split(ProjectLayout::Rows, 1, 4)
-            .unwrap();
+        let (source, rows) = tab.project_layout_split(ProjectLayout::Rows, 1, 4).unwrap();
         assert_eq!(source, 0);
         assert_eq!(rows.direction, SplitDirection::Vertical);
         assert_eq!(rows.size, SplitSize::Cells(10));
 
-        let (source, grid) = tab
-            .project_layout_split(ProjectLayout::Grid, 3, 4)
-            .unwrap();
+        let (source, grid) = tab.project_layout_split(ProjectLayout::Grid, 3, 4).unwrap();
         assert_eq!(source, 2);
         assert_eq!(grid.direction, SplitDirection::Vertical);
         assert_eq!(grid.size, SplitSize::Percent(50));
-        assert!(tab.project_layout_split(ProjectLayout::Single, 1, 2).is_none());
-        assert!(tab.project_layout_split(ProjectLayout::Tabs, 1, 2).is_none());
+        assert!(tab
+            .project_layout_split(ProjectLayout::Single, 1, 2)
+            .is_none());
+        assert!(tab
+            .project_layout_split(ProjectLayout::Tabs, 1, 2)
+            .is_none());
         assert_eq!("tabs".parse::<ProjectLayout>(), Ok(ProjectLayout::Tabs));
     }
 

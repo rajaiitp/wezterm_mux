@@ -91,7 +91,10 @@ pub trait Domain: Downcast + Send + Sync {
     async fn spawn_project_layout(&self, request: ProjectLayoutRequest) -> anyhow::Result<()> {
         anyhow::ensure!(!request.workspace.is_empty(), "project workspace is empty");
         anyhow::ensure!(!request.panes.is_empty(), "project workspace has no panes");
-        anyhow::ensure!(request.panes.len() <= 4, "project workspace has too many panes");
+        anyhow::ensure!(
+            request.panes.len() <= 4,
+            "project workspace has too many panes"
+        );
 
         let mux = Mux::get();
         let size = mux.project_spawn_size(request.size, &request.workspace);
@@ -114,6 +117,47 @@ pub trait Domain: Downcast + Send + Sync {
         let tab = self
             .spawn(size, first.command, first.command_dir, window_id)
             .await?;
+
+        if layout == ProjectLayout::Tabs {
+            // The first tab is the agent/review split. Every remaining
+            // application gets a separate tab, preserving the configured order.
+            if total >= 2 {
+                let pane = request.panes[1].clone();
+                let (source_index, split_request) = tab
+                    .project_layout_split(ProjectLayout::Columns, 1, 2)
+                    .ok_or_else(|| anyhow::anyhow!("tabs layout cannot create its first split"))?;
+                let source = tab
+                    .iter_panes()
+                    .into_iter()
+                    .nth(source_index)
+                    .ok_or_else(|| anyhow::anyhow!("tabs layout source pane is missing"))?;
+                self.split_pane(
+                    SplitSource::Spawn {
+                        command: pane.command,
+                        command_dir: pane.command_dir,
+                    },
+                    tab.tab_id(),
+                    source.pane.pane_id(),
+                    split_request,
+                )
+                .await?;
+            }
+
+            for pane in request.panes.into_iter().skip(2) {
+                self.spawn(size, pane.command, pane.command_dir, window_id)
+                    .await?;
+            }
+
+            // Start the workspace on the first tab and its leftmost pane.
+            tab.set_active_idx(0);
+            let mut window = mux
+                .get_window_mut(window_id)
+                .ok_or_else(|| anyhow::anyhow!("project window disappeared"))?;
+            if let Some(tab_index) = window.idx_by_id(tab.tab_id()) {
+                window.set_active_without_saving(tab_index);
+            }
+            return Ok(());
+        }
 
         for (step, pane) in request.panes.into_iter().enumerate().skip(1) {
             let (source_index, split_request) = tab

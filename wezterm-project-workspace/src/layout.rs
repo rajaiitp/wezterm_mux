@@ -70,7 +70,10 @@ impl LayoutProfile {
             ),
             "unknown project layout {layout:?}"
         );
-        anyhow::ensure!(!self.applications.is_empty(), "project layout has no modules");
+        anyhow::ensure!(
+            !self.applications.is_empty(),
+            "project layout has no modules"
+        );
         anyhow::ensure!(
             self.applications.len() <= 4,
             "project layouts support at most four modules"
@@ -94,6 +97,12 @@ impl LayoutProfile {
             anyhow::ensure!(
                 self.applications.len() == 1,
                 "single layout requires exactly one module"
+            );
+        }
+        if layout == "tabs" {
+            anyhow::ensure!(
+                self.applications.len() >= 2,
+                "tabs layout requires at least two modules"
             );
         }
         if layout == "three-pane" {
@@ -121,6 +130,10 @@ mod tests {
 
     #[test]
     fn validates_named_layouts_without_ratios() {
+        let mut tabs = LayoutProfile::default_agentic();
+        tabs.layout = "tabs".to_string();
+        assert!(tabs.validate().is_ok());
+
         let profile = LayoutProfile {
             name: "grid".to_string(),
             layout: "grid".to_string(),
