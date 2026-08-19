@@ -568,13 +568,17 @@ impl super::TermWindow {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
                 TabBarItem::RightStatus => {
-                    if self.workspace_at_right_status(&ui_item).is_some() {
-                        self.show_workspace_dropdown();
+                    if let Some(workspace) = self.workspace_at_right_status(&ui_item) {
+                        if let Some(front_end) = crate::frontend::try_front_end() {
+                            front_end.switch_workspace(&workspace, false);
+                        }
                     }
                 }
                 TabBarItem::LeftStatus => {
-                    if self.workspace_at_left_status(&ui_item).is_some() {
-                        self.show_workspace_dropdown();
+                    if let Some(workspace) = self.workspace_at_left_status(&ui_item) {
+                        if let Some(front_end) = crate::frontend::try_front_end() {
+                            front_end.switch_workspace(&workspace, false);
+                        }
                     }
                 }
                 TabBarItem::None => {

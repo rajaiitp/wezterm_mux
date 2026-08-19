@@ -70,23 +70,28 @@ impl crate::TermWindow {
             self.pane_padding_pixels();
         let os_border = self.get_os_border();
         // The mux reserves one cell at each split for resize hit testing.
-        // Render pane borders at the split center: the first pane extends
-        // into the left/top half and the second pane starts from the center.
-        let outer_x = padding_left + os_border.left.get() as f32 + pos.left as f32 * cell_width
-            - if pos.left == 0 { 0.0 } else { cell_width / 2.0 };
-        let outer_y = top_bar_height
-            + padding_top
-            + os_border.top.get() as f32
-            + pos.top as f32 * cell_height
-            - if pos.top == 0 { 0.0 } else { cell_height / 2.0 };
-        // A single-pane tab is the complete terminal surface even if its
-        // cached pane dimensions briefly lag the window's cell grid. Do not
-        // interpret that transient mismatch as a split; doing so makes the
-        // border jump by the split hit-target width after the first resize.
+        // Offset a pane by half a cell only when it has a neighboring split on
+        // that edge. This keeps the outer edge of every split rectangle on the
+        // same divider coordinate, including nested splits.
+        let has_left_split = !single_pane && pos.left > 0;
+        let has_top_split = !single_pane && pos.top > 0;
         let has_right_split =
             !single_pane && pos.left + pos.width < self.terminal_size.cols as usize;
         let has_bottom_split =
             !single_pane && pos.top + pos.height < self.terminal_size.rows as usize;
+        let outer_x = padding_left
+            + os_border.left.get() as f32
+            + pos.left as f32 * cell_width
+            - if has_left_split { cell_width / 2.0 } else { 0.0 };
+        let outer_y = top_bar_height
+            + padding_top
+            + os_border.top.get() as f32
+            + pos.top as f32 * cell_height
+            - if has_top_split { cell_height / 2.0 } else { 0.0 };
+        // A single-pane tab is the complete terminal surface even if its
+        // cached pane dimensions briefly lag the window's cell grid. Do not
+        // interpret that transient mismatch as a split; doing so makes the
+        // border jump by the split hit-target width after the first resize.
         let outer_width = if !has_right_split {
             (self.dimensions.pixel_width as f32
                 - outer_x
@@ -94,10 +99,11 @@ impl crate::TermWindow {
                 - os_border.right.get() as f32)
                 .max(0.0)
         } else {
-            // The mux reserves one cell for the split resize hit target. Extend
-            // the visual border into half of that cell so it meets the next
-            // pane's border at the split center.
-            pos.width as f32 * cell_width + cell_width / 2.0
+            // The mux reserves one cell for the split resize hit target. Add
+            // the half-cell needed to compensate for a left split's offset;
+            // root panes otherwise need no extra extent on this edge.
+            pos.width as f32 * cell_width
+                + if has_left_split { cell_width / 2.0 } else { 0.0 }
         };
         let outer_height = if !has_bottom_split {
             (self.dimensions.pixel_height as f32
@@ -107,28 +113,27 @@ impl crate::TermWindow {
                 - os_border.bottom.get() as f32)
                 .max(0.0)
         } else {
-            pos.height as f32 * cell_height + cell_height / 2.0
+            pos.height as f32 * cell_height
+                + if has_top_split { cell_height / 2.0 } else { 0.0 }
         };
         // Pane padding separates neighboring panels, but it should not stack
         // with window padding at the outer edges.
-        let inset_left = if pos.left == 0 {
-            0.0
-        } else {
+        let inset_left = if has_left_split {
             pane_padding_left
-        };
-        let inset_top = if pos.top == 0 { 0.0 } else { pane_padding_top };
-        let inset_right = if single_pane || pos.left + pos.width >= self.terminal_size.cols as usize
-        {
-            0.0
         } else {
-            pane_padding_right
+            0.0
         };
-        let inset_bottom =
-            if single_pane || pos.top + pos.height >= self.terminal_size.rows as usize {
-                0.0
-            } else {
-                pane_padding_bottom
-            };
+        let inset_top = if has_top_split { pane_padding_top } else { 0.0 };
+        let inset_right = if has_right_split {
+            pane_padding_right
+        } else {
+            0.0
+        };
+        let inset_bottom = if has_bottom_split {
+            pane_padding_bottom
+        } else {
+            0.0
+        };
         let x = outer_x + inset_left;
         let y = outer_y + inset_top;
         let width = (outer_width - inset_left - inset_right).max(0.0);
